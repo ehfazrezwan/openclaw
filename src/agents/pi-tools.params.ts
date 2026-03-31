@@ -145,6 +145,19 @@ export function normalizeToolParams(params: unknown): Record<string, unknown> | 
   normalizeTextLikeParam(normalized, "content");
   normalizeTextLikeParam(normalized, "oldText");
   normalizeTextLikeParam(normalized, "newText");
+  // Normalize aliases inside edits array entries (pi-coding-agent nested format).
+  if (Array.isArray(normalized.edits)) {
+    normalized.edits = (normalized.edits as unknown[]).map((edit) => {
+      if (!edit || typeof edit !== "object") {
+        return edit;
+      }
+      const entry = { ...(edit as Record<string, unknown>) };
+      normalizeClaudeParamAliases(entry);
+      normalizeTextLikeParam(entry, "oldText");
+      normalizeTextLikeParam(entry, "newText");
+      return entry;
+    });
+  }
   return normalized;
 }
 
@@ -178,6 +191,35 @@ export function patchToolSchemaForClaudeCompatibility(tool: AnyAgentTool): AnyAg
   };
 }
 
+function isParamSatisfiedInEditsArray(
+  record: Record<string, unknown>,
+  keys: readonly string[],
+  allowEmpty: boolean,
+): boolean {
+  if (!Array.isArray(record.edits)) {
+    return false;
+  }
+  return (record.edits as unknown[]).some((edit) => {
+    if (!edit || typeof edit !== "object") {
+      return false;
+    }
+    const entry = edit as Record<string, unknown>;
+    return keys.some((key) => {
+      if (!(key in entry)) {
+        return false;
+      }
+      const value = entry[key];
+      if (typeof value !== "string") {
+        return false;
+      }
+      if (allowEmpty) {
+        return true;
+      }
+      return value.trim().length > 0;
+    });
+  });
+}
+
 export function assertRequiredParams(
   record: Record<string, unknown> | undefined,
   groups: readonly RequiredParamGroup[],
@@ -189,19 +231,20 @@ export function assertRequiredParams(
 
   const missingLabels: string[] = [];
   for (const group of groups) {
-    const satisfied = group.keys.some((key) => {
-      if (!(key in record)) {
-        return false;
-      }
-      const value = record[key];
-      if (typeof value !== "string") {
-        return false;
-      }
-      if (group.allowEmpty) {
-        return true;
-      }
-      return value.trim().length > 0;
-    });
+    const satisfied =
+      group.keys.some((key) => {
+        if (!(key in record)) {
+          return false;
+        }
+        const value = record[key];
+        if (typeof value !== "string") {
+          return false;
+        }
+        if (group.allowEmpty) {
+          return true;
+        }
+        return value.trim().length > 0;
+      }) || isParamSatisfiedInEditsArray(record, group.keys, !!group.allowEmpty);
 
     if (!satisfied) {
       const label = group.label ?? group.keys.join(" or ");
