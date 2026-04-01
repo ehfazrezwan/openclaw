@@ -12,13 +12,12 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  // Clear all timers and state
   for (const state of statusByChatId.values()) {
     if (state.pendingTimer) {
       clearTimeout(state.pendingTimer);
     }
-    if (state.completionTimer) {
-      clearTimeout(state.completionTimer);
+    if (state.elapsedTimer) {
+      clearInterval(state.elapsedTimer);
     }
   }
   statusByChatId.clear();
@@ -51,7 +50,6 @@ function sentEvent(content: string, overrides: Record<string, unknown> = {}) {
 function mockHttpsRequest(responseBody: object = { ok: true, result: { message_id: 99 } }) {
   const responseJson = JSON.stringify(responseBody);
   vi.spyOn(https, "request").mockImplementation((_opts, callback) => {
-    // Simulate an async response
     if (callback) {
       const cb = callback as (res: { on: (e: string, h: (d?: Buffer) => void) => void }) => void;
       process.nextTick(() => {
@@ -90,18 +88,10 @@ describe("telegram-status-pin hook", () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
-  it("skips heartbeat messages on received", async () => {
+  it("skips heartbeat messages", async () => {
     vi.useFakeTimers();
     mockHttpsRequest();
     await handler(receivedEvent("HEARTBEAT_OK"));
-    vi.advanceTimersByTime(WORK_DELAY_MS + 100);
-    expect(https.request).not.toHaveBeenCalled();
-  });
-
-  it("skips heartbeat messages (prefix match)", async () => {
-    vi.useFakeTimers();
-    mockHttpsRequest();
-    await handler(receivedEvent("HEARTBEAT_OK extra data"));
     vi.advanceTimersByTime(WORK_DELAY_MS + 100);
     expect(https.request).not.toHaveBeenCalled();
   });
@@ -123,33 +113,66 @@ describe("telegram-status-pin hook", () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
-  it("on message:received, sets a pending timer", async () => {
+  it("strips telegram: prefix from conversationId", async () => {
     vi.useFakeTimers();
     mockHttpsRequest();
-    await handler(receivedEvent("Hello"));
+    await handler(receivedEvent("Hello", { conversationId: "telegram:5225642693" }));
 
     const state = statusByChatId.get("5225642693");
     expect(state).toBeDefined();
-    expect(state!.pendingTimer).toBeDefined();
-    expect(state!.startedAt).toBeInstanceOf(Date);
-
-    // Timer should not have fired yet
-    expect(https.request).not.toHaveBeenCalled();
+    expect(state!.chatId).toBe("5225642693");
   });
 
-  it("on message:received, fires API call after delay", async () => {
+  it("does not call API before 15s threshold", async () => {
     vi.useFakeTimers();
     mockHttpsRequest();
     await handler(receivedEvent("Hello"));
 
-    // Advance past the delay
-    vi.advanceTimersByTime(WORK_DELAY_MS + 100);
-
-    // Should have called Telegram API (sendMessage since no existing messageId)
-    expect(https.request).toHaveBeenCalled();
+    // Advance to 14s — still under threshold
+    vi.advanceTimersByTime(14_000);
+    expect(https.request).not.toHaveBeenCalled();
   });
 
-  it("on message:sent within delay, cancels pending timer", async () => {
+  it("after 15s: sends message and pins it", async () => {
+    vi.useFakeTimers();
+    mockHttpsRequest();
+    await handler(receivedEvent("Hello"));
+
+    // Advance past 15s threshold
+    vi.advanceTimersByTime(WORK_DELAY_MS + 100);
+
+    // Allow microtasks (nextTick callbacks in mock) to flush
+    await vi.advanceTimersByTimeAsync(100);
+
+    // Should have called sendMessage + pinChatMessage
+    const calls = (https.request as ReturnType<typeof vi.fn>).mock.calls;
+    const methods = calls.map((c: unknown[]) => (c[0] as { path: string }).path);
+    expect(methods.some((m: string) => m.includes("sendMessage"))).toBe(true);
+    expect(methods.some((m: string) => m.includes("pinChatMessage"))).toBe(true);
+  });
+
+  it("elapsed timer updates message text after initial send", async () => {
+    vi.useFakeTimers();
+    mockHttpsRequest();
+    await handler(receivedEvent("Hello"));
+
+    // Fire pending timer (15s) + flush microtasks
+    await vi.advanceTimersByTimeAsync(WORK_DELAY_MS + 100);
+
+    // Clear call history after initial send+pin
+    (https.request as ReturnType<typeof vi.fn>).mockClear();
+    mockHttpsRequest();
+
+    // Advance by elapsed interval (5s) + flush microtasks
+    await vi.advanceTimersByTimeAsync(5_100);
+
+    // Should have called editMessageText to update elapsed time
+    const calls = (https.request as ReturnType<typeof vi.fn>).mock.calls;
+    const methods = calls.map((c: unknown[]) => (c[0] as { path: string }).path);
+    expect(methods.some((m: string) => m.includes("editMessageText"))).toBe(true);
+  });
+
+  it("handleSent cancels pending timer (no API call if reply is fast)", async () => {
     vi.useFakeTimers();
     mockHttpsRequest();
 
@@ -157,46 +180,39 @@ describe("telegram-status-pin hook", () => {
     const state = statusByChatId.get("5225642693");
     expect(state!.pendingTimer).toBeDefined();
 
-    // Agent replies quickly (within 3s)
+    // Agent replies quickly (within 15s)
     await handler(sentEvent("Here's the answer"));
 
-    // Timer should be cancelled
-    expect(state!.pendingTimer).toBeUndefined();
+    // State should be cleared entirely
+    expect(statusByChatId.has("5225642693")).toBe(false);
 
     // Advance time — no API call should happen
     vi.advanceTimersByTime(WORK_DELAY_MS + 100);
     expect(https.request).not.toHaveBeenCalled();
   });
 
-  it("on message:sent, does not call API if no status message was shown", async () => {
-    const spy = vi.spyOn(https, "request");
-
-    // Send a received then immediately sent (within delay)
-    await handler(receivedEvent("Hello"));
-    await handler(sentEvent("Quick reply"));
-
-    expect(spy).not.toHaveBeenCalled();
-  });
-
-  it("on message:sent with existing status message, edits to Done", async () => {
+  it("handleSent calls deleteMessage if messageId exists", async () => {
     mockHttpsRequest();
 
     // Simulate existing state with a pinned message
     statusByChatId.set("5225642693", {
       chatId: "5225642693",
       messageId: 42,
-      startedAt: new Date(Date.now() - 5000),
+      startedAt: new Date(Date.now() - 20_000),
     });
 
     await handler(sentEvent("Here's your answer"));
 
-    // Should have called editMessageText
+    // Should have called deleteMessage
     expect(https.request).toHaveBeenCalled();
     const callArgs = (https.request as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(callArgs[0].path).toContain("editMessageText");
+    expect(callArgs[0].path).toContain("deleteMessage");
+
+    // State should be cleared
+    expect(statusByChatId.has("5225642693")).toBe(false);
   });
 
-  it("handles Telegram API errors silently (no throw)", async () => {
+  it("deleteMessage failure is swallowed silently", async () => {
     vi.spyOn(https, "request").mockImplementation((_opts, _callback) => {
       const mockReq = {
         on: vi.fn((event: string, cb: (err: Error) => void) => {
@@ -211,7 +227,6 @@ describe("telegram-status-pin hook", () => {
       return mockReq as unknown as ReturnType<typeof https.request>;
     });
 
-    // Set up state with existing message
     statusByChatId.set("5225642693", {
       chatId: "5225642693",
       messageId: 42,
