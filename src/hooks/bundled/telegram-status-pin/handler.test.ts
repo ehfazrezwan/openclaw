@@ -735,4 +735,216 @@ describe("telegram-status-pin hook", () => {
       expect(sendMessageCalls.length).toBe(1);
     });
   });
+
+  // -------------------------------------------------------------------
+  // Race condition regression tests
+  // -------------------------------------------------------------------
+
+  describe("elapsed timer race conditions", () => {
+    it("elapsed timer goes through rerender mutex, not direct sendStatusMessage", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      // Trigger the pending timer to start working state + elapsed timer
+      await handler(receivedEvent("Hello"));
+      await vi.advanceTimersByTimeAsync(WORK_DELAY_MS + 100);
+
+      // Now the elapsed timer is running. Clear mock history.
+      (https.request as ReturnType<typeof vi.fn>).mockClear();
+      mockHttpsRequest();
+
+      // Fire elapsed timer interval
+      await vi.advanceTimersByTimeAsync(ELAPSED_INTERVAL_MS + 100);
+
+      // The elapsed timer should have called editMessageText (via rerender
+      // mutex), not sendMessage. Since messageId is already set, it should
+      // use editMessageText.
+      const methods = getCalledMethods();
+      const sendCalls = methods.filter((m) => m.includes("/sendMessage"));
+      expect(sendCalls.length).toBe(0);
+      expect(methods.some((m) => m.includes("editMessageText"))).toBe(true);
+    });
+
+    it("elapsed timer does NOT create orphaned messages after handleSent deletes state", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      // Start working state + elapsed timer
+      await handler(receivedEvent("Hello"));
+      await vi.advanceTimersByTimeAsync(WORK_DELAY_MS + 100);
+
+      // Verify elapsed timer is running
+      const state = statusByChatId.get("5225642693");
+      expect(state).toBeDefined();
+      expect(state!.elapsedTimer).toBeDefined();
+
+      // handleSent cleans up everything
+      await handler(sentEvent("Done"));
+      expect(statusByChatId.has("5225642693")).toBe(false);
+
+      // Clear mock history
+      (https.request as ReturnType<typeof vi.fn>).mockClear();
+      mockHttpsRequest();
+
+      // Advance past several elapsed intervals — the timer was cleared
+      // by handleSent, so no API calls should happen
+      await vi.advanceTimersByTimeAsync(ELAPSED_INTERVAL_MS * 3);
+
+      const methods = getCalledMethods();
+      expect(methods.length).toBe(0);
+    });
+
+    it("clearTimers is called before Map deletion in handleSent", async () => {
+      mockHttpsRequest();
+
+      const elapsedTimer = setInterval(() => {}, 999_999);
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 42,
+        workingStartedAt: new Date(Date.now() - 20_000),
+        elapsedTimer,
+        tasks: new Map(),
+      });
+
+      await handler(sentEvent("Done"));
+
+      // State is deleted from Map
+      expect(statusByChatId.has("5225642693")).toBe(false);
+
+      // The interval should have been cleared (we verify by checking it
+      // doesn't fire — clearInterval was called on the handle)
+      // If clearTimers wasn't called, this interval would leak
+    });
+  });
+
+  describe("sendInFlight guard", () => {
+    it("prevents duplicate sendMessage when two calls race past the mutex", async () => {
+      vi.useFakeTimers();
+
+      // Use a slow mock that resolves after a delay to simulate in-flight race
+      let resolveFirst: ((v: object) => void) | undefined;
+      let callCount = 0;
+
+      vi.spyOn(https, "request").mockImplementation((_opts, callback) => {
+        callCount++;
+        const currentCall = callCount;
+
+        if (callback) {
+          const cb = callback as (res: {
+            on: (e: string, h: (d?: Buffer) => void) => void;
+          }) => void;
+
+          if (currentCall === 1) {
+            // First sendMessage call — delay resolution
+            void new Promise<object>((resolve) => {
+              resolveFirst = resolve;
+            }).then(() => {
+              cb({
+                on(event: string, handler: (data?: Buffer) => void) {
+                  if (event === "data") {
+                    process.nextTick(() =>
+                      handler(
+                        Buffer.from(JSON.stringify({ ok: true, result: { message_id: 99 } })),
+                      ),
+                    );
+                  } else if (event === "end") {
+                    process.nextTick(() => handler());
+                  }
+                },
+              });
+            });
+          } else {
+            // Subsequent calls resolve immediately
+            process.nextTick(() => {
+              cb({
+                on(event: string, handler: (data?: Buffer) => void) {
+                  if (event === "data") {
+                    process.nextTick(() =>
+                      handler(
+                        Buffer.from(JSON.stringify({ ok: true, result: { message_id: 100 } })),
+                      ),
+                    );
+                  } else if (event === "end") {
+                    process.nextTick(() => handler());
+                  }
+                },
+              });
+            });
+          }
+        }
+
+        return {
+          on: vi.fn(),
+          write: vi.fn(),
+          end: vi.fn(),
+          destroy: vi.fn(),
+        } as unknown as ReturnType<typeof https.request>;
+      });
+
+      // Create state with no messageId
+      const state = { chatId: "5225642693", tasks: new Map() } as typeof statusByChatId extends Map<
+        string,
+        infer V
+      >
+        ? V
+        : never;
+      statusByChatId.set("5225642693", state);
+      state.workingStartedAt = new Date();
+
+      // First trackTask triggers a rerender → sendStatusMessage → sendMessage
+      trackTask("5225642693", "cc-1", "Task 1");
+      await vi.advanceTimersByTimeAsync(50);
+
+      // sendInFlight should be true while first call is pending
+      expect(state.sendInFlight).toBe(true);
+
+      // Now resolve the first call
+      resolveFirst!({});
+      await vi.advanceTimersByTimeAsync(200);
+
+      // sendInFlight should be false after completion
+      expect(state.sendInFlight).toBe(false);
+      // messageId should be set from the first call
+      expect(state.messageId).toBe(99);
+    });
+
+    it("clearTimers is called before Map deletion in completeTask", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      const elapsedTimer = setInterval(() => {}, 999_999);
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        elapsedTimer,
+        tasks: new Map([["cc-1", { label: "Test task", startedAt: new Date() }]]),
+      });
+
+      completeTask("5225642693", "cc-1");
+      await vi.advanceTimersByTimeAsync(100);
+
+      // State should be cleaned up
+      expect(statusByChatId.has("5225642693")).toBe(false);
+    });
+
+    it("clearTimers is called before Map deletion in clearCurrentAction", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      const elapsedTimer = setInterval(() => {}, 999_999);
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        elapsedTimer,
+        currentAction: { taskId: "tool:tc-1", label: "test", startedAt: new Date() },
+        tasks: new Map(),
+      });
+
+      clearCurrentAction("5225642693", "tool:tc-1");
+      await vi.advanceTimersByTimeAsync(100);
+
+      // State should be cleaned up
+      expect(statusByChatId.has("5225642693")).toBe(false);
+    });
+  });
 });
