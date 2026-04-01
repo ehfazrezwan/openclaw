@@ -4,6 +4,11 @@
  * Subscribes to agent tool events (start/end) via `onAgentEvent` and calls
  * `trackTask` / `completeTask` on the status-pin handler so the pinned card
  * reflects which tools K.I.T.T. is currently executing.
+ *
+ * For persistent tools like `sessions_spawn`, the tool call returns quickly
+ * (status: "accepted") while the spawned session runs in the background.
+ * The bridge defers `completeTask` until the child run's lifecycle:end event
+ * fires, so the pinned card persists for the entire session duration.
  */
 
 import { onAgentEvent, getAgentRunContext } from "../../../infra/agent-events.js";
@@ -18,6 +23,14 @@ const PERSISTENT_TOOLS = new Set(["sessions_spawn"]);
  * cleaned up (the root cause of orphaned pinned status cards).
  */
 const taskChatIdMap = new Map<string, { chatId: string; isPersistent: boolean }>();
+
+/**
+ * Maps child runId → { chatId, taskId } for persistent tools that spawned
+ * background sessions. The task is completed when a lifecycle:end/error event
+ * arrives for that runId. The 2-hour TASK_TIMEOUT_MS safety net in the handler
+ * covers cases where lifecycle events are not received (e.g. remote gateway).
+ */
+const pendingRunCompletions = new Map<string, { chatId: string; taskId: string }>();
 
 function labelForTool(toolName: string, args: Record<string, unknown>): string {
   if (toolName === "sessions_spawn" && typeof args.task === "string") {
@@ -64,8 +77,44 @@ export function extractTelegramChatId(sessionKey: string): string | null {
   return match ? match[2] : null;
 }
 
+/**
+ * Extract the child runId from a persistent tool's result.
+ *
+ * For sessions_spawn, the tool result has the structure:
+ *   { content: [{ type: "text", text: "..." }], details: { status, runId, ... } }
+ *
+ * After sanitization, the `details` field is preserved. A non-empty `runId`
+ * indicates the session was successfully spawned and is running in the background.
+ */
+function extractChildRunId(result: unknown): string | null {
+  if (!result || typeof result !== "object") {
+    return null;
+  }
+  const details = (result as Record<string, unknown>).details;
+  if (!details || typeof details !== "object") {
+    return null;
+  }
+  const runId = (details as Record<string, unknown>).runId;
+  return typeof runId === "string" && runId.trim() ? runId.trim() : null;
+}
+
 export function startAgentEventBridge(): () => void {
   return onAgentEvent((evt) => {
+    // Handle lifecycle events for child run completion detection.
+    // When a persistent tool (sessions_spawn) spawns a background session,
+    // we defer completeTask until the child run ends.
+    if (evt.stream === "lifecycle") {
+      const { phase } = evt.data as { phase?: string };
+      if (phase === "end" || phase === "error") {
+        const pending = pendingRunCompletions.get(evt.runId);
+        if (pending) {
+          pendingRunCompletions.delete(evt.runId);
+          completeTask(pending.chatId, pending.taskId);
+        }
+      }
+      return;
+    }
+
     if (evt.stream !== "tool") {
       return;
     }
@@ -110,7 +159,7 @@ export function startAgentEventBridge(): () => void {
       } else {
         setCurrentAction(chatId, taskId, label);
       }
-    } else if (phase === "end" || phase === "error") {
+    } else if (phase === "end" || phase === "result" || phase === "error") {
       // First try the stored mapping (reliable even after run context cleanup).
       // Fall back to getAgentRunContext for backward compatibility.
       const stored = taskChatIdMap.get(toolCallId);
@@ -137,7 +186,20 @@ export function startAgentEventBridge(): () => void {
       }
 
       if (resolvedPersistent) {
-        completeTask(chatId, taskId);
+        // For persistent tools, check if a background session was spawned.
+        // If so, defer completeTask until the child run's lifecycle event.
+        const eventData = evt.data;
+        const isError = eventData.isError === true;
+        const childRunId = isError ? null : extractChildRunId(eventData.result);
+
+        if (childRunId) {
+          // Session spawned successfully — keep the task on the card.
+          // It will be completed when the child run emits lifecycle:end.
+          pendingRunCompletions.set(childRunId, { chatId, taskId });
+        } else {
+          // Spawn failed, errored, or no child runId — complete immediately.
+          completeTask(chatId, taskId);
+        }
       } else {
         clearCurrentAction(chatId, taskId);
       }
@@ -146,4 +208,4 @@ export function startAgentEventBridge(): () => void {
 }
 
 // Exported for testing
-export { taskChatIdMap };
+export { taskChatIdMap, pendingRunCompletions, extractChildRunId };
