@@ -231,12 +231,7 @@ function ensureElapsedTimer(token: string, state: ChatStatus): void {
   }
 
   state.elapsedTimer = setInterval(() => {
-    const text = renderCard(state);
-    if (!text) {
-      return;
-    }
-
-    sendStatusMessage(token, state, text).catch((err) => {
+    rerender(token, state).catch((err) => {
       log.debug("Failed to update elapsed time", {
         error: err instanceof Error ? err.message : String(err),
       });
