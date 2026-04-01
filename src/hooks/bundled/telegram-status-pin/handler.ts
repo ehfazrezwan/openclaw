@@ -27,6 +27,8 @@ const log = createSubsystemLogger("hooks/telegram-status-pin");
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const WORK_DELAY_MS = 15_000;
 const ELAPSED_INTERVAL_MS = 5_000;
+/** Maximum lifetime for a persistent task before auto-cleanup (safety net). */
+const TASK_TIMEOUT_MS = 30 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -35,6 +37,8 @@ const ELAPSED_INTERVAL_MS = 5_000;
 interface TaskEntry {
   label: string;
   startedAt: Date;
+  /** Safety-net timer: auto-completes the task after TASK_TIMEOUT_MS. */
+  timeoutTimer?: ReturnType<typeof setTimeout>;
 }
 
 interface ChatStatus {
@@ -297,6 +301,13 @@ function clearTimers(state: ChatStatus): void {
     clearInterval(state.elapsedTimer);
     state.elapsedTimer = undefined;
   }
+  // Clear safety-net timeouts for all tracked tasks
+  for (const task of state.tasks.values()) {
+    if (task.timeoutTimer) {
+      clearTimeout(task.timeoutTimer);
+      task.timeoutTimer = undefined;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -323,7 +334,14 @@ function trackTask(chatId: string, taskId: string, label: string): void {
   }
 
   const state = getOrCreateState(chatId);
-  state.tasks.set(taskId, { label, startedAt: new Date() });
+
+  // Safety-net timeout: auto-complete the task if completeTask is never called
+  const timeoutTimer = setTimeout(() => {
+    log.debug("Task timeout — auto-completing orphaned task", { chatId, taskId });
+    completeTask(chatId, taskId);
+  }, TASK_TIMEOUT_MS);
+
+  state.tasks.set(taskId, { label, startedAt: new Date(), timeoutTimer });
 
   rerender(token, state).catch((err) => {
     log.debug("Failed to re-render after trackTask", {
@@ -346,6 +364,12 @@ function completeTask(chatId: string, taskId: string): void {
   const state = statusByChatId.get(chatId);
   if (!state) {
     return;
+  }
+
+  // Clear the safety-net timeout for this task
+  const task = state.tasks.get(taskId);
+  if (task?.timeoutTimer) {
+    clearTimeout(task.timeoutTimer);
   }
 
   state.tasks.delete(taskId);
@@ -523,4 +547,11 @@ export default telegramStatusPinHandler;
 export { trackTask, completeTask, setCurrentAction, clearCurrentAction };
 
 // Exported for testing
-export { statusByChatId, WORK_DELAY_MS, ELAPSED_INTERVAL_MS, renderCard, rerenderLocks };
+export {
+  statusByChatId,
+  WORK_DELAY_MS,
+  ELAPSED_INTERVAL_MS,
+  TASK_TIMEOUT_MS,
+  renderCard,
+  rerenderLocks,
+};
