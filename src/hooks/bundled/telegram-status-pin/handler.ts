@@ -542,10 +542,60 @@ async function handleSent(token: string, chatId: string): Promise<void> {
   statusByChatId.delete(chatId);
 }
 
+// ---------------------------------------------------------------------------
+// Run-end cleanup (secondary path for silent replies / NO_REPLY)
+// ---------------------------------------------------------------------------
+
+/**
+ * Called when the parent agent run ends (lifecycle phase: "end" or "error").
+ * Performs the same cleanup as `handleSent` so the "Working..." card is removed
+ * even when `message:sent` never fires (e.g. NO_REPLY / silent reply).
+ *
+ * Idempotent: if `handleSent` already cleaned up, this is a no-op because
+ * `statusByChatId.get(chatId)` returns undefined.
+ */
+function handleRunEnd(chatId: string): void {
+  const token = getBotToken();
+  if (!token) {
+    return;
+  }
+
+  const state = statusByChatId.get(chatId);
+  if (!state) {
+    return;
+  }
+
+  // Clear the pending "working" timer
+  if (state.pendingTimer) {
+    clearTimeout(state.pendingTimer);
+    state.pendingTimer = undefined;
+  }
+
+  // Clear ephemeral state
+  state.workingStartedAt = undefined;
+  state.currentAction = undefined;
+
+  // If persistent tasks are still active, re-render without the ephemeral
+  // lines but keep the card alive for the tasks.
+  if (state.tasks.size > 0) {
+    rerender(token, state).catch((err) => {
+      log.debug("Failed to re-render after handleRunEnd", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+    return;
+  }
+
+  // No tasks and no working state — clean up entirely
+  clearTimers(state);
+  deleteStatusMessage(token, state).catch(() => {});
+  statusByChatId.delete(chatId);
+}
+
 export default telegramStatusPinHandler;
 
 // Exported for programmatic use
-export { trackTask, completeTask, setCurrentAction, clearCurrentAction };
+export { trackTask, completeTask, setCurrentAction, clearCurrentAction, handleRunEnd };
 
 // Exported for testing
 export {
