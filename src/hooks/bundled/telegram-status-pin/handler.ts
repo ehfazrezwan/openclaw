@@ -158,33 +158,33 @@ function callTelegramApi(
 
 async function sendStatusMessage(
   token: string,
-  chatId: string,
+  state: ChatStatus,
   text: string,
-  existingMessageId?: number,
 ): Promise<number | undefined> {
-  if (existingMessageId) {
+  if (state.messageId) {
     const res = await callTelegramApi(token, "editMessageText", {
-      chat_id: chatId,
-      message_id: existingMessageId,
+      chat_id: state.chatId,
+      message_id: state.messageId,
       text,
     });
     if (res.ok) {
-      return existingMessageId;
+      return state.messageId;
     }
     // If edit fails (message deleted etc.), fall through to send a new one
-    log.debug("editMessageText failed, sending new message", { chatId });
+    log.debug("editMessageText failed, sending new message", { chatId: state.chatId });
   }
 
   const res = await callTelegramApi(token, "sendMessage", {
-    chat_id: chatId,
+    chat_id: state.chatId,
     text,
     disable_notification: true,
   });
 
   const messageId = res.result?.message_id;
   if (res.ok && messageId) {
+    state.messageId = messageId;
     await callTelegramApi(token, "pinChatMessage", {
-      chat_id: chatId,
+      chat_id: state.chatId,
       message_id: messageId,
       disable_notification: true,
     });
@@ -221,18 +221,11 @@ function ensureElapsedTimer(token: string, state: ChatStatus): void {
       return;
     }
 
-    sendStatusMessage(token, state.chatId, text, state.messageId).then(
-      (updatedId) => {
-        if (updatedId !== undefined) {
-          state.messageId = updatedId;
-        }
-      },
-      (err) => {
-        log.debug("Failed to update elapsed time", {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      },
-    );
+    sendStatusMessage(token, state, text).catch((err) => {
+      log.debug("Failed to update elapsed time", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
   }, ELAPSED_INTERVAL_MS);
 }
 
@@ -240,7 +233,7 @@ function ensureElapsedTimer(token: string, state: ChatStatus): void {
  * Re-render the card for a given chatId.
  * Creates the pinned message if needed, or deletes it if nothing to show.
  */
-async function rerender(token: string, state: ChatStatus): Promise<void> {
+async function rerenderImpl(token: string, state: ChatStatus): Promise<void> {
   const hasWork = state.tasks.size > 0 || state.workingStartedAt !== undefined;
 
   if (!hasWork) {
@@ -251,12 +244,19 @@ async function rerender(token: string, state: ChatStatus): Promise<void> {
   }
 
   const text = renderCard(state);
-  const msgId = await sendStatusMessage(token, state.chatId, text, state.messageId);
-  if (msgId !== undefined) {
-    state.messageId = msgId;
-  }
-
+  await sendStatusMessage(token, state, text);
   ensureElapsedTimer(token, state);
+}
+
+/** Per-chatId mutex to prevent concurrent rerender race conditions. */
+const rerenderLocks = new Map<string, Promise<void>>();
+
+async function rerender(token: string, state: ChatStatus): Promise<void> {
+  const chatId = state.chatId;
+  const prev = rerenderLocks.get(chatId) ?? Promise.resolve();
+  const next = prev.then(() => rerenderImpl(token, state)).catch(() => {});
+  rerenderLocks.set(chatId, next);
+  await next;
 }
 
 // ---------------------------------------------------------------------------
@@ -433,4 +433,4 @@ export default telegramStatusPinHandler;
 export { trackTask, completeTask };
 
 // Exported for testing
-export { statusByChatId, WORK_DELAY_MS, ELAPSED_INTERVAL_MS, renderCard };
+export { statusByChatId, WORK_DELAY_MS, ELAPSED_INTERVAL_MS, renderCard, rerenderLocks };
