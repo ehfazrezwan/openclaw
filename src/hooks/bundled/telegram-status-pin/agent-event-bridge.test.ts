@@ -21,7 +21,11 @@ vi.mock("../../../infra/agent-events.js", () => ({
 }));
 
 import { getAgentRunContext } from "../../../infra/agent-events.js";
-import { startAgentEventBridge, extractTelegramChatId } from "./agent-event-bridge.js";
+import {
+  startAgentEventBridge,
+  extractTelegramChatId,
+  taskChatIdMap,
+} from "./agent-event-bridge.js";
 import { trackTask, completeTask, setCurrentAction, clearCurrentAction } from "./handler.js";
 
 const mockGetAgentRunContext = getAgentRunContext as ReturnType<typeof vi.fn>;
@@ -53,6 +57,7 @@ beforeEach(() => {
   vi.mocked(setCurrentAction).mockClear();
   vi.mocked(clearCurrentAction).mockClear();
   mockGetAgentRunContext.mockReset();
+  taskChatIdMap.clear();
 
   // Default: valid Telegram session with no heartbeat
   mockGetAgentRunContext.mockReturnValue({
@@ -383,6 +388,138 @@ describe("agent-event-bridge", () => {
   // -------------------------------------------------------------------
   // Missing event data fields
   // -------------------------------------------------------------------
+
+  // -------------------------------------------------------------------
+  // chatId mapping for reliable tool:end resolution
+  // -------------------------------------------------------------------
+
+  describe("taskChatIdMap for reliable tool:end", () => {
+    it("stores chatId on tool:start and uses it on tool:end even when run context is gone", () => {
+      startAgentEventBridge();
+
+      // tool:start — run context is available
+      fireToolEvent({
+        data: { phase: "start", name: "sessions_spawn", args: { task: "Fix bug" } },
+      });
+      expect(trackTask).toHaveBeenCalledOnce();
+      expect(taskChatIdMap.has("tc-001")).toBe(true);
+
+      // Simulate run context being cleaned up
+      mockGetAgentRunContext.mockReturnValue(undefined);
+
+      // tool:end — run context is gone, but chatId is in the map
+      fireToolEvent({ data: { phase: "end", name: "sessions_spawn" } });
+      expect(completeTask).toHaveBeenCalledOnce();
+      expect(completeTask).toHaveBeenCalledWith("5225642693", "tool:tc-001");
+
+      // Mapping should be cleaned up after use
+      expect(taskChatIdMap.has("tc-001")).toBe(false);
+    });
+
+    it("uses stored isPersistent flag from mapping on tool:end", () => {
+      startAgentEventBridge();
+
+      // tool:start as persistent tool
+      fireToolEvent({
+        data: { phase: "start", name: "sessions_spawn", args: { task: "Task" } },
+      });
+      expect(trackTask).toHaveBeenCalledOnce();
+
+      // tool:end — even if the name is different due to some wrapper, isPersistent
+      // is resolved from the stored mapping
+      mockGetAgentRunContext.mockReturnValue(undefined);
+      fireToolEvent({
+        data: { phase: "end", name: "sessions_spawn", toolCallId: "tc-001" },
+      });
+
+      expect(completeTask).toHaveBeenCalledOnce();
+      expect(clearCurrentAction).not.toHaveBeenCalled();
+    });
+
+    it("stores chatId for ephemeral tools and clears on tool:end", () => {
+      startAgentEventBridge();
+
+      // tool:start — ephemeral
+      fireToolEvent({
+        data: { phase: "start", name: "web_search", args: { query: "test" } },
+      });
+      expect(setCurrentAction).toHaveBeenCalledOnce();
+      expect(taskChatIdMap.has("tc-001")).toBe(true);
+
+      // Run context gone
+      mockGetAgentRunContext.mockReturnValue(undefined);
+
+      // tool:end — resolved from mapping
+      fireToolEvent({ data: { phase: "end", name: "web_search" } });
+      expect(clearCurrentAction).toHaveBeenCalledOnce();
+      expect(clearCurrentAction).toHaveBeenCalledWith("5225642693", "tool:tc-001");
+      expect(taskChatIdMap.has("tc-001")).toBe(false);
+    });
+
+    it("falls back to getAgentRunContext when mapping is missing on tool:end", () => {
+      startAgentEventBridge();
+
+      // Directly fire tool:end without a prior tool:start (edge case)
+      fireToolEvent({ data: { phase: "end", name: "web_search" } });
+
+      // Should still work via getAgentRunContext fallback
+      expect(clearCurrentAction).toHaveBeenCalledOnce();
+      expect(clearCurrentAction).toHaveBeenCalledWith("5225642693", "tool:tc-001");
+    });
+
+    it("drops tool:end when both mapping and run context are missing", () => {
+      startAgentEventBridge();
+
+      mockGetAgentRunContext.mockReturnValue(undefined);
+
+      // No prior tool:start, no run context — should be silently dropped
+      fireToolEvent({ data: { phase: "end", name: "web_search" } });
+
+      expect(clearCurrentAction).not.toHaveBeenCalled();
+      expect(completeTask).not.toHaveBeenCalled();
+    });
+
+    it("handles tool:error the same as tool:end", () => {
+      startAgentEventBridge();
+
+      fireToolEvent({
+        data: { phase: "start", name: "sessions_spawn", args: { task: "Fail" } },
+      });
+      expect(trackTask).toHaveBeenCalledOnce();
+
+      mockGetAgentRunContext.mockReturnValue(undefined);
+
+      fireToolEvent({ data: { phase: "error", name: "sessions_spawn" } });
+      expect(completeTask).toHaveBeenCalledOnce();
+      expect(taskChatIdMap.has("tc-001")).toBe(false);
+    });
+
+    it("does not store mapping for non-telegram sessions", () => {
+      mockGetAgentRunContext.mockReturnValue({
+        sessionKey: "agent:main:whatsapp:direct:+15551234567",
+        isHeartbeat: false,
+      });
+
+      startAgentEventBridge();
+      fireToolEvent();
+
+      expect(taskChatIdMap.has("tc-001")).toBe(false);
+      expect(setCurrentAction).not.toHaveBeenCalled();
+    });
+
+    it("does not store mapping for heartbeat runs", () => {
+      mockGetAgentRunContext.mockReturnValue({
+        sessionKey: "agent:main:telegram:direct:5225642693",
+        isHeartbeat: true,
+      });
+
+      startAgentEventBridge();
+      fireToolEvent();
+
+      expect(taskChatIdMap.has("tc-001")).toBe(false);
+      expect(setCurrentAction).not.toHaveBeenCalled();
+    });
+  });
 
   describe("missing event data fields", () => {
     it("ignores events with missing phase", () => {

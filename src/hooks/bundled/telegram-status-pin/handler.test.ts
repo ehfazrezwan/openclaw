@@ -5,6 +5,8 @@ import {
   statusByChatId,
   WORK_DELAY_MS,
   ELAPSED_INTERVAL_MS,
+  TASK_TIMEOUT_MS,
+  SENT_GRACE_MS,
   renderCard,
   rerenderLocks,
   trackTask,
@@ -29,6 +31,14 @@ afterEach(() => {
     }
     if (state.elapsedTimer) {
       clearInterval(state.elapsedTimer);
+    }
+    if (state.sentGraceTimer) {
+      clearTimeout(state.sentGraceTimer);
+    }
+    for (const task of state.tasks.values()) {
+      if (task.timeoutTimer) {
+        clearTimeout(task.timeoutTimer);
+      }
     }
   }
   statusByChatId.clear();
@@ -944,6 +954,203 @@ describe("telegram-status-pin hook", () => {
       await vi.advanceTimersByTimeAsync(100);
 
       // State should be cleaned up
+      expect(statusByChatId.has("5225642693")).toBe(false);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Task timeout safety net
+  // -------------------------------------------------------------------
+
+  describe("task timeout safety net", () => {
+    it("auto-completes a task after TASK_TIMEOUT_MS", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      trackTask("5225642693", "cc-1", "sessions_spawn: Long task");
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Task should exist
+      const state = statusByChatId.get("5225642693");
+      expect(state).toBeDefined();
+      expect(state!.tasks.has("cc-1")).toBe(true);
+
+      // Clear call history
+      (https.request as ReturnType<typeof vi.fn>).mockClear();
+      mockHttpsRequest();
+
+      // Advance past the timeout
+      await vi.advanceTimersByTimeAsync(TASK_TIMEOUT_MS + 100);
+
+      // Task should be auto-completed and state cleaned up
+      expect(statusByChatId.has("5225642693")).toBe(false);
+
+      // Should have called deleteMessage
+      const methods = getCalledMethods();
+      expect(methods.some((m) => m.includes("deleteMessage"))).toBe(true);
+    });
+
+    it("timeout timer is cleared when completeTask is called normally", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      trackTask("5225642693", "cc-1", "sessions_spawn: Quick task");
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Complete the task normally
+      completeTask("5225642693", "cc-1");
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(statusByChatId.has("5225642693")).toBe(false);
+
+      // Clear call history
+      (https.request as ReturnType<typeof vi.fn>).mockClear();
+      mockHttpsRequest();
+
+      // Advance past timeout — should NOT fire since it was cleared
+      await vi.advanceTimersByTimeAsync(TASK_TIMEOUT_MS + 100);
+
+      // No additional API calls from the timeout
+      expect(https.request).not.toHaveBeenCalled();
+    });
+
+    it("timeout timer is cleared when clearTimers runs (e.g. via handleSent)", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      trackTask("5225642693", "cc-1", "sessions_spawn: Test");
+      await vi.advanceTimersByTimeAsync(100);
+
+      // handleSent triggers grace timer, which eventually clears everything
+      await handler(sentEvent("Done"));
+      await vi.advanceTimersByTimeAsync(SENT_GRACE_MS + 100);
+
+      expect(statusByChatId.has("5225642693")).toBe(false);
+
+      // Clear call history
+      (https.request as ReturnType<typeof vi.fn>).mockClear();
+
+      // Advance past timeout — should NOT fire
+      await vi.advanceTimersByTimeAsync(TASK_TIMEOUT_MS + 100);
+
+      expect(https.request).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Post-sent grace period
+  // -------------------------------------------------------------------
+
+  describe("post-sent grace period", () => {
+    it("force-cleans orphaned tasks after SENT_GRACE_MS", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      // Set up state with a persistent task and a message
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        tasks: new Map([["cc-1", { label: "sessions_spawn: Orphan", startedAt: new Date() }]]),
+      });
+
+      // handleSent sets the grace timer
+      await handler(sentEvent("Done"));
+
+      // Task should still exist right after handleSent
+      const state = statusByChatId.get("5225642693");
+      expect(state).toBeDefined();
+      expect(state!.tasks.size).toBe(1);
+      expect(state!.sentGraceTimer).toBeDefined();
+
+      // Clear call history
+      (https.request as ReturnType<typeof vi.fn>).mockClear();
+      mockHttpsRequest();
+
+      // Advance past grace period — tasks should be force-cleaned
+      await vi.advanceTimersByTimeAsync(SENT_GRACE_MS + 100);
+
+      expect(statusByChatId.has("5225642693")).toBe(false);
+      const methods = getCalledMethods();
+      expect(methods.some((m) => m.includes("deleteMessage"))).toBe(true);
+    });
+
+    it("grace timer is cancelled when completeTask arrives in time", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        tasks: new Map([["cc-1", { label: "sessions_spawn: Quick", startedAt: new Date() }]]),
+      });
+
+      // handleSent sets the grace timer
+      await handler(sentEvent("Done"));
+
+      const state = statusByChatId.get("5225642693");
+      expect(state!.sentGraceTimer).toBeDefined();
+
+      // completeTask arrives within grace period
+      completeTask("5225642693", "cc-1");
+      await vi.advanceTimersByTimeAsync(100);
+
+      // State should be cleaned up immediately by completeTask
+      expect(statusByChatId.has("5225642693")).toBe(false);
+
+      // Clear call history
+      (https.request as ReturnType<typeof vi.fn>).mockClear();
+
+      // Advance past grace period — no orphan cleanup should fire
+      await vi.advanceTimersByTimeAsync(SENT_GRACE_MS + 100);
+      expect(https.request).not.toHaveBeenCalled();
+    });
+
+    it("grace timer is reset on subsequent handleSent calls", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        tasks: new Map([["cc-1", { label: "sessions_spawn: Multi", startedAt: new Date() }]]),
+      });
+
+      // First handleSent sets grace timer
+      await handler(sentEvent("First reply"));
+      const state = statusByChatId.get("5225642693");
+      const firstTimer = state!.sentGraceTimer;
+      expect(firstTimer).toBeDefined();
+
+      // Advance partially (2s), then another handleSent resets the timer
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      await handler(sentEvent("Second reply"));
+      expect(state!.sentGraceTimer).toBeDefined();
+      expect(state!.sentGraceTimer).not.toBe(firstTimer);
+
+      // Advance 3s more — first timer would have fired (5s total) but the
+      // reset means we still have 3s left on the new timer
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(statusByChatId.has("5225642693")).toBe(true);
+
+      // Advance past the new timer
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(statusByChatId.has("5225642693")).toBe(false);
+    });
+
+    it("does not set grace timer when no persistent tasks remain", async () => {
+      mockHttpsRequest();
+
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        workingStartedAt: new Date(),
+        tasks: new Map(),
+      });
+
+      await handler(sentEvent("Done"));
+
+      // State should be fully cleaned up immediately — no grace timer needed
       expect(statusByChatId.has("5225642693")).toBe(false);
     });
   });
