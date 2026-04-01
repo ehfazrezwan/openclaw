@@ -2,9 +2,9 @@
  * Telegram Status Pin hook handler
  *
  * Maintains a single pinned "status" message in Telegram chats that shows
- * real-time progress when the agent is doing long-running work. On
- * message:received (after a 3s delay) the status updates to "Working...".
- * On message:sent it switches to "Done" and then "Standby" after 10s.
+ * real-time progress when the agent is doing long-running work. Only shows
+ * a status card if no reply arrives within 15 seconds. Deletes the status
+ * message on completion.
  */
 
 import https from "node:https";
@@ -14,15 +14,14 @@ import type { HookHandler } from "../../hooks.js";
 const log = createSubsystemLogger("hooks/telegram-status-pin");
 
 const TELEGRAM_API_BASE = "https://api.telegram.org";
-const WORK_DELAY_MS = 3_000;
-const STANDBY_DELAY_MS = 10_000;
-const AGENT_NAME = "K.I.T.T.";
+const WORK_DELAY_MS = 15_000;
+const ELAPSED_INTERVAL_MS = 5_000;
 
 interface StatusState {
   chatId: string;
   messageId?: number;
   pendingTimer?: ReturnType<typeof setTimeout>;
-  completionTimer?: ReturnType<typeof setTimeout>;
+  elapsedTimer?: ReturnType<typeof setInterval>;
   startedAt?: Date;
 }
 
@@ -36,36 +35,12 @@ function isHeartbeat(content: string): boolean {
   return content === "HEARTBEAT_OK" || content.startsWith("HEARTBEAT_OK");
 }
 
-function formatTime(date: Date): string {
-  return date.toLocaleTimeString("en-GB", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
-}
-
 function workingText(startedAt: Date): string {
-  return [
-    `⚙️ ${AGENT_NAME} — Working`,
-    "──────────────────────",
-    "⏳ Processing your request...",
-    `Started: ${formatTime(startedAt)}`,
-  ].join("\n");
-}
-
-function doneText(durationSeconds: number): string {
-  return [
-    `⚙️ ${AGENT_NAME} — Ready`,
-    "──────────────────────",
-    `✅ Last response: ${durationSeconds}s ago`,
-  ].join("\n");
-}
-
-function standbyText(): string {
-  return [`⚙️ ${AGENT_NAME} — Standby`, "──────────────────────", "💤 Waiting for input"].join(
-    "\n",
-  );
+  const elapsedSeconds = Math.round((Date.now() - startedAt.getTime()) / 1000);
+  if (elapsedSeconds < 5) {
+    return "\u2699\uFE0F Working...";
+  }
+  return `\u2699\uFE0F Working... (${elapsedSeconds}s)`;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,7 +99,7 @@ function callTelegramApi(
   });
 }
 
-async function sendOrEditStatus(
+async function sendStatusMessage(
   token: string,
   chatId: string,
   text: string,
@@ -151,7 +126,6 @@ async function sendOrEditStatus(
 
   const messageId = res.result?.message_id;
   if (res.ok && messageId) {
-    // Pin the message silently
     await callTelegramApi(token, "pinChatMessage", {
       chat_id: chatId,
       message_id: messageId,
@@ -175,14 +149,12 @@ const telegramStatusPinHandler: HookHandler = async (event) => {
   const context = event.context || {};
   const channelId = context.channelId as string | undefined;
 
-  // Only handle Telegram channels
   if (channelId !== "telegram") {
     return;
   }
 
   const content = context.content as string | undefined;
 
-  // Skip heartbeat messages
   if (content && isHeartbeat(content)) {
     return;
   }
@@ -192,7 +164,8 @@ const telegramStatusPinHandler: HookHandler = async (event) => {
     return;
   }
 
-  const chatId = context.conversationId as string | undefined;
+  const rawId = context.conversationId as string | undefined;
+  const chatId = rawId?.startsWith("telegram:") ? rawId.slice("telegram:".length) : rawId;
   if (!chatId) {
     return;
   }
@@ -208,6 +181,17 @@ const telegramStatusPinHandler: HookHandler = async (event) => {
   }
 };
 
+function clearTimers(state: StatusState): void {
+  if (state.pendingTimer) {
+    clearTimeout(state.pendingTimer);
+    state.pendingTimer = undefined;
+  }
+  if (state.elapsedTimer) {
+    clearInterval(state.elapsedTimer);
+    state.elapsedTimer = undefined;
+  }
+}
+
 function handleReceived(token: string, chatId: string): void {
   let state = statusByChatId.get(chatId);
   if (!state) {
@@ -215,28 +199,36 @@ function handleReceived(token: string, chatId: string): void {
     statusByChatId.set(chatId, state);
   }
 
-  // Clear any existing completion timer (we got a new message while in "Done" state)
-  if (state.completionTimer) {
-    clearTimeout(state.completionTimer);
-    state.completionTimer = undefined;
-  }
-
-  // Clear any existing pending timer
-  if (state.pendingTimer) {
-    clearTimeout(state.pendingTimer);
-  }
+  clearTimers(state);
 
   state.startedAt = new Date();
 
-  // Set a 3s delay — if the agent hasn't replied by then, show "Working..."
+  // Only show status if no reply arrives within 15s
   state.pendingTimer = setTimeout(() => {
     state.pendingTimer = undefined;
     const startedAt = state.startedAt ?? new Date();
-    sendOrEditStatus(token, chatId, workingText(startedAt), state.messageId).then(
+
+    sendStatusMessage(token, chatId, workingText(startedAt), state.messageId).then(
       (msgId) => {
         if (msgId !== undefined) {
           state.messageId = msgId;
         }
+
+        // Start updating elapsed time every 5s
+        state.elapsedTimer = setInterval(() => {
+          sendStatusMessage(token, chatId, workingText(startedAt), state.messageId).then(
+            (updatedId) => {
+              if (updatedId !== undefined) {
+                state.messageId = updatedId;
+              }
+            },
+            (err) => {
+              log.debug("Failed to update elapsed time", {
+                error: err instanceof Error ? err.message : String(err),
+              });
+            },
+          );
+        }, ELAPSED_INTERVAL_MS);
       },
       (err) => {
         log.debug("Failed to send working status", {
@@ -253,55 +245,21 @@ async function handleSent(token: string, chatId: string): Promise<void> {
     return;
   }
 
-  // Cancel pending "Working..." timer if agent replied quickly
-  if (state.pendingTimer) {
-    clearTimeout(state.pendingTimer);
-    state.pendingTimer = undefined;
+  clearTimers(state);
+
+  if (state.messageId) {
+    await callTelegramApi(token, "deleteMessage", {
+      chat_id: chatId,
+      message_id: state.messageId,
+    }).catch(() => {
+      // Swallow delete failures silently
+    });
   }
 
-  // Clear any existing completion timer
-  if (state.completionTimer) {
-    clearTimeout(state.completionTimer);
-    state.completionTimer = undefined;
-  }
-
-  // If we never showed a status message, no need to update
-  if (!state.messageId) {
-    state.startedAt = undefined;
-    return;
-  }
-
-  // Calculate duration
-  const durationSeconds = state.startedAt
-    ? Math.round((Date.now() - state.startedAt.getTime()) / 1000)
-    : 0;
-  state.startedAt = undefined;
-
-  // Edit to "Done"
-  const msgId = await sendOrEditStatus(token, chatId, doneText(durationSeconds), state.messageId);
-  if (msgId !== undefined) {
-    state.messageId = msgId;
-  }
-
-  // After 10s, switch to "Standby"
-  state.completionTimer = setTimeout(() => {
-    state.completionTimer = undefined;
-    sendOrEditStatus(token, chatId, standbyText(), state.messageId).then(
-      (msgId) => {
-        if (msgId !== undefined) {
-          state.messageId = msgId;
-        }
-      },
-      (err) => {
-        log.debug("Failed to send standby status", {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      },
-    );
-  }, STANDBY_DELAY_MS);
+  statusByChatId.delete(chatId);
 }
 
 export default telegramStatusPinHandler;
 
 // Exported for testing
-export { statusByChatId, WORK_DELAY_MS, STANDBY_DELAY_MS };
+export { statusByChatId, WORK_DELAY_MS, ELAPSED_INTERVAL_MS };
