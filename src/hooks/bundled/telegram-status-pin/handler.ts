@@ -343,6 +343,14 @@ function completeTask(chatId: string, taskId: string): void {
 
   state.tasks.delete(taskId);
 
+  // Auto-delete immediately when nothing remains
+  if (state.tasks.size === 0 && !state.currentAction && !state.workingStartedAt) {
+    clearTimers(state);
+    deleteStatusMessage(token, state).catch(() => {});
+    statusByChatId.delete(chatId);
+    return;
+  }
+
   rerender(token, state).catch((err) => {
     log.debug("Failed to re-render after completeTask", {
       error: err instanceof Error ? err.message : String(err),
@@ -390,6 +398,14 @@ function clearCurrentAction(chatId: string, taskId: string): void {
   }
 
   state.currentAction = undefined;
+
+  // Auto-delete immediately when nothing remains
+  if (state.tasks.size === 0 && !state.workingStartedAt) {
+    clearTimers(state);
+    deleteStatusMessage(token, state).catch(() => {});
+    statusByChatId.delete(chatId);
+    return;
+  }
 
   rerender(token, state).catch((err) => {
     log.debug("Failed to re-render after clearCurrentAction", {
