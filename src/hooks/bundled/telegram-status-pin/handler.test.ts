@@ -12,6 +12,7 @@ import {
   completeTask,
   setCurrentAction,
   clearCurrentAction,
+  handleRunEnd,
 } from "./handler.js";
 
 let handler: typeof import("./handler.js").default;
@@ -1034,6 +1035,153 @@ describe("telegram-status-pin hook", () => {
       await vi.advanceTimersByTimeAsync(TASK_TIMEOUT_MS + 100);
 
       expect(statusByChatId.has("5225642693")).toBe(false);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Run-end cleanup (handleRunEnd — secondary path for NO_REPLY)
+  // -------------------------------------------------------------------
+
+  describe("handleRunEnd", () => {
+    it("cleans up Working card when message:sent never fires (NO_REPLY scenario)", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      // 1. message:received starts the pending timer
+      await handler(receivedEvent("Hello"));
+
+      // 2. pending timer fires — shows "Working..." card
+      await vi.advanceTimersByTimeAsync(WORK_DELAY_MS + 100);
+
+      const state = statusByChatId.get("5225642693");
+      expect(state).toBeDefined();
+      expect(state!.workingStartedAt).toBeDefined();
+      expect(state!.messageId).toBe(99);
+
+      // Clear call history
+      (https.request as ReturnType<typeof vi.fn>).mockClear();
+      mockHttpsRequest();
+
+      // 3. run-end fires WITHOUT message:sent — should clean up
+      handleRunEnd("5225642693");
+
+      // Flush microtasks for the async deleteStatusMessage
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Card should be cleaned up
+      expect(statusByChatId.has("5225642693")).toBe(false);
+
+      // Should have called deleteMessage
+      const methods = getCalledMethods();
+      expect(methods.some((m) => m.includes("deleteMessage"))).toBe(true);
+    });
+
+    it("keeps card alive when persistent tasks are still active", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      // State has both working state and a persistent task
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        workingStartedAt: new Date(),
+        tasks: new Map([
+          ["cc-1", { label: "sessions_spawn: Build feature", startedAt: new Date() }],
+        ]),
+      });
+
+      handleRunEnd("5225642693");
+
+      // Flush microtasks
+      await vi.advanceTimersByTimeAsync(100);
+
+      // State should still exist — persistent task is active
+      const state = statusByChatId.get("5225642693");
+      expect(state).toBeDefined();
+      expect(state!.workingStartedAt).toBeUndefined();
+      expect(state!.currentAction).toBeUndefined();
+      expect(state!.tasks.size).toBe(1);
+      expect(state!.tasks.has("cc-1")).toBe(true);
+
+      // Should have re-rendered (editMessageText), not deleted
+      const methods = getCalledMethods();
+      expect(methods.some((m) => m.includes("editMessageText"))).toBe(true);
+      expect(methods.some((m) => m.includes("deleteMessage"))).toBe(false);
+    });
+
+    it("is idempotent — no error when both message:sent and handleRunEnd fire", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      // Set up working state with a pinned message
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        workingStartedAt: new Date(),
+        tasks: new Map(),
+      });
+
+      // message:sent fires first — cleans up
+      await handler(sentEvent("Here's the answer"));
+      expect(statusByChatId.has("5225642693")).toBe(false);
+
+      // handleRunEnd fires second — should be a no-op (state already gone)
+      handleRunEnd("5225642693");
+
+      // Flush microtasks
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Still cleaned up, no errors
+      expect(statusByChatId.has("5225642693")).toBe(false);
+    });
+
+    it("is a no-op for unknown chatId", () => {
+      const spy = vi.spyOn(https, "request");
+      handleRunEnd("nonexistent");
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it("is a no-op when bot token is missing", () => {
+      vi.stubEnv("TELEGRAM_BOT_TOKEN", "");
+      const spy = vi.spyOn(https, "request");
+
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        workingStartedAt: new Date(),
+        tasks: new Map(),
+      });
+
+      handleRunEnd("5225642693");
+
+      expect(spy).not.toHaveBeenCalled();
+      // State is untouched — no cleanup without token
+      expect(statusByChatId.has("5225642693")).toBe(true);
+    });
+
+    it("clears pending timer even when card has not appeared yet", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      // message:received starts the pending timer (card not yet shown)
+      await handler(receivedEvent("Hello"));
+      const state = statusByChatId.get("5225642693");
+      expect(state).toBeDefined();
+      expect(state!.pendingTimer).toBeDefined();
+      expect(state!.workingStartedAt).toBeUndefined(); // card not shown yet
+
+      // run-end fires before 15s — should cancel the pending timer
+      handleRunEnd("5225642693");
+
+      // Flush microtasks
+      await vi.advanceTimersByTimeAsync(100);
+
+      // State should be cleaned up (no tasks, no working state)
+      expect(statusByChatId.has("5225642693")).toBe(false);
+
+      // Advance past the pending timer — should NOT fire
+      await vi.advanceTimersByTimeAsync(WORK_DELAY_MS + 100);
+      expect(https.request).not.toHaveBeenCalled();
     });
   });
 });

@@ -6,6 +6,7 @@ vi.mock("./handler.js", () => ({
   completeTask: vi.fn(),
   setCurrentAction: vi.fn(),
   clearCurrentAction: vi.fn(),
+  handleRunEnd: vi.fn(),
 }));
 
 // Mock agent-events — capture the listener so we can fire events manually
@@ -28,7 +29,13 @@ import {
   taskChatIdMap,
   pendingRunCompletions,
 } from "./agent-event-bridge.js";
-import { trackTask, completeTask, setCurrentAction, clearCurrentAction } from "./handler.js";
+import {
+  trackTask,
+  completeTask,
+  setCurrentAction,
+  clearCurrentAction,
+  handleRunEnd,
+} from "./handler.js";
 
 const mockGetAgentRunContext = getAgentRunContext as ReturnType<typeof vi.fn>;
 
@@ -58,6 +65,7 @@ beforeEach(() => {
   vi.mocked(completeTask).mockClear();
   vi.mocked(setCurrentAction).mockClear();
   vi.mocked(clearCurrentAction).mockClear();
+  vi.mocked(handleRunEnd).mockClear();
   mockGetAgentRunContext.mockReset();
   taskChatIdMap.clear();
   pendingRunCompletions.clear();
@@ -256,7 +264,7 @@ describe("agent-event-bridge", () => {
   });
 
   describe("non-tool event streams", () => {
-    it("ignores lifecycle events", () => {
+    it("does not route lifecycle events to tool tracking", () => {
       startAgentEventBridge();
       fireToolEvent({ stream: "lifecycle" });
 
@@ -719,7 +727,7 @@ describe("agent-event-bridge", () => {
       expect(pendingRunCompletions.has("child-run-1")).toBe(false);
     });
 
-    it("ignores lifecycle:end events that don't match any pending run", () => {
+    it("does not call completeTask for lifecycle:end events that don't match a pending run", () => {
       startAgentEventBridge();
 
       capturedListener?.({
@@ -732,6 +740,9 @@ describe("agent-event-bridge", () => {
 
       expect(completeTask).not.toHaveBeenCalled();
       expect(trackTask).not.toHaveBeenCalled();
+      // handleRunEnd IS called for the parent run-end cleanup path
+      expect(handleRunEnd).toHaveBeenCalledOnce();
+      expect(handleRunEnd).toHaveBeenCalledWith("5225642693");
     });
 
     it("ignores lifecycle:start events (only end/error trigger completion)", () => {
@@ -812,6 +823,134 @@ describe("agent-event-bridge", () => {
       expect(completeTask).toHaveBeenCalledWith("5225642693", "tool:tc-001");
       expect(pendingRunCompletions.size).toBe(0);
       expect(taskChatIdMap.size).toBe(0);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Run-end cleanup (handleRunEnd for NO_REPLY / silent reply)
+  // -------------------------------------------------------------------
+
+  describe("run-end lifecycle cleanup", () => {
+    it("calls handleRunEnd when parent run ends with a telegram session", () => {
+      startAgentEventBridge();
+
+      capturedListener?.({
+        runId: "parent-run-1",
+        seq: 1,
+        stream: "lifecycle",
+        ts: Date.now(),
+        data: { phase: "end", endedAt: Date.now() },
+      });
+
+      expect(handleRunEnd).toHaveBeenCalledOnce();
+      expect(handleRunEnd).toHaveBeenCalledWith("5225642693");
+    });
+
+    it("calls handleRunEnd on lifecycle:error too", () => {
+      startAgentEventBridge();
+
+      capturedListener?.({
+        runId: "parent-run-1",
+        seq: 1,
+        stream: "lifecycle",
+        ts: Date.now(),
+        data: { phase: "error", error: "LLM request failed" },
+      });
+
+      expect(handleRunEnd).toHaveBeenCalledOnce();
+      expect(handleRunEnd).toHaveBeenCalledWith("5225642693");
+    });
+
+    it("does not call handleRunEnd for non-telegram sessions", () => {
+      mockGetAgentRunContext.mockReturnValue({
+        sessionKey: "agent:main:whatsapp:direct:+15551234567",
+        isHeartbeat: false,
+      });
+
+      startAgentEventBridge();
+
+      capturedListener?.({
+        runId: "parent-run-1",
+        seq: 1,
+        stream: "lifecycle",
+        ts: Date.now(),
+        data: { phase: "end" },
+      });
+
+      expect(handleRunEnd).not.toHaveBeenCalled();
+    });
+
+    it("does not call handleRunEnd for heartbeat runs", () => {
+      mockGetAgentRunContext.mockReturnValue({
+        sessionKey: "agent:main:telegram:direct:5225642693",
+        isHeartbeat: true,
+      });
+
+      startAgentEventBridge();
+
+      capturedListener?.({
+        runId: "heartbeat-run",
+        seq: 1,
+        stream: "lifecycle",
+        ts: Date.now(),
+        data: { phase: "end" },
+      });
+
+      expect(handleRunEnd).not.toHaveBeenCalled();
+    });
+
+    it("does not call handleRunEnd when run context is missing", () => {
+      mockGetAgentRunContext.mockReturnValue(undefined);
+
+      startAgentEventBridge();
+
+      capturedListener?.({
+        runId: "unknown-run",
+        seq: 1,
+        stream: "lifecycle",
+        ts: Date.now(),
+        data: { phase: "end" },
+      });
+
+      expect(handleRunEnd).not.toHaveBeenCalled();
+    });
+
+    it("does not call handleRunEnd for lifecycle:start events", () => {
+      startAgentEventBridge();
+
+      capturedListener?.({
+        runId: "parent-run-1",
+        seq: 1,
+        stream: "lifecycle",
+        ts: Date.now(),
+        data: { phase: "start" },
+      });
+
+      expect(handleRunEnd).not.toHaveBeenCalled();
+    });
+
+    it("calls both completeTask and handleRunEnd when child run ends", () => {
+      startAgentEventBridge();
+
+      // Set up a pending child run completion
+      pendingRunCompletions.set("child-run-1", {
+        chatId: "5225642693",
+        taskId: "tool:tc-001",
+      });
+
+      capturedListener?.({
+        runId: "child-run-1",
+        seq: 1,
+        stream: "lifecycle",
+        ts: Date.now(),
+        data: { phase: "end" },
+      });
+
+      // Both paths fire — completeTask for child run, handleRunEnd for cleanup
+      expect(completeTask).toHaveBeenCalledOnce();
+      expect(completeTask).toHaveBeenCalledWith("5225642693", "tool:tc-001");
+      expect(handleRunEnd).toHaveBeenCalledOnce();
+      expect(handleRunEnd).toHaveBeenCalledWith("5225642693");
     });
   });
 });
