@@ -2,9 +2,20 @@
  * Telegram Status Pin hook handler
  *
  * Maintains a single pinned "status" message in Telegram chats that shows
- * real-time progress when the agent is doing long-running work. Only shows
- * a status card if no reply arrives within 15 seconds. Deletes the status
- * message on completion.
+ * real-time progress when the agent is doing long-running work. Functions
+ * as a live task board — multiple named tasks can be tracked simultaneously.
+ *
+ * Hook behaviour (message:received / message:sent):
+ *   - On received: starts a 15s pending timer. If no reply arrives, shows
+ *     a generic "Working..." card.
+ *   - On sent: cancels the pending timer and cleans up (if no named tasks
+ *     are active).
+ *
+ * Programmatic API (trackTask / completeTask):
+ *   - trackTask(chatId, taskId, label)  — adds a named task entry
+ *   - completeTask(chatId, taskId)      — removes a named task entry
+ *   Both immediately re-render the pinned card. When no tasks remain and
+ *   no general working state is active, the card is deleted.
  */
 
 import https from "node:https";
@@ -17,15 +28,31 @@ const TELEGRAM_API_BASE = "https://api.telegram.org";
 const WORK_DELAY_MS = 15_000;
 const ELAPSED_INTERVAL_MS = 5_000;
 
-interface StatusState {
+// ---------------------------------------------------------------------------
+// Data model
+// ---------------------------------------------------------------------------
+
+interface TaskEntry {
+  label: string;
+  startedAt: Date;
+}
+
+interface ChatStatus {
   chatId: string;
   messageId?: number;
   pendingTimer?: ReturnType<typeof setTimeout>;
   elapsedTimer?: ReturnType<typeof setInterval>;
-  startedAt?: Date;
+  /** General "working" start time — set when pendingTimer fires */
+  workingStartedAt?: Date;
+  /** Named tasks currently active */
+  tasks: Map<string, TaskEntry>;
 }
 
-const statusByChatId = new Map<string, StatusState>();
+const statusByChatId = new Map<string, ChatStatus>();
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function getBotToken(): string {
   return process.env.TELEGRAM_BOT_TOKEN?.trim() ?? "";
@@ -35,12 +62,42 @@ function isHeartbeat(content: string): boolean {
   return content === "HEARTBEAT_OK" || content.startsWith("HEARTBEAT_OK");
 }
 
-function workingText(startedAt: Date): string {
-  const elapsedSeconds = Math.round((Date.now() - startedAt.getTime()) / 1000);
-  if (elapsedSeconds < 5) {
-    return "\u2699\uFE0F Working...";
+function formatElapsed(startedAt: Date): string {
+  const seconds = Math.round((Date.now() - startedAt.getTime()) / 1000);
+  if (seconds < 60) {
+    return `${seconds}s`;
   }
-  return `\u2699\uFE0F Working... (${elapsedSeconds}s)`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return `${minutes}m ${remainder}s`;
+}
+
+/**
+ * Build the status card text from current state.
+ *
+ * - If named tasks exist, show each as a bullet with elapsed time.
+ * - If only the general working state is active, show a single line.
+ */
+function renderCard(state: ChatStatus): string {
+  const lines: string[] = [];
+
+  if (state.tasks.size > 0) {
+    lines.push("\u2699\uFE0F K.I.T.T. is working...");
+    lines.push("");
+    for (const entry of state.tasks.values()) {
+      lines.push(`\u2022 ${entry.label} (${formatElapsed(entry.startedAt)})`);
+    }
+  } else if (state.workingStartedAt) {
+    const elapsed = formatElapsed(state.workingStartedAt);
+    const seconds = Math.round((Date.now() - state.workingStartedAt.getTime()) / 1000);
+    if (seconds < 5) {
+      lines.push("\u2699\uFE0F Working...");
+    } else {
+      lines.push(`\u2699\uFE0F Working... (${elapsed})`);
+    }
+  }
+
+  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -137,8 +194,146 @@ async function sendStatusMessage(
   return undefined;
 }
 
+async function deleteStatusMessage(token: string, state: ChatStatus): Promise<void> {
+  if (state.messageId) {
+    await callTelegramApi(token, "deleteMessage", {
+      chat_id: state.chatId,
+      message_id: state.messageId,
+    }).catch(() => {
+      // Swallow delete failures silently
+    });
+    state.messageId = undefined;
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Hook handler
+// Shared rendering helpers
+// ---------------------------------------------------------------------------
+
+function ensureElapsedTimer(token: string, state: ChatStatus): void {
+  if (state.elapsedTimer) {
+    return;
+  }
+
+  state.elapsedTimer = setInterval(() => {
+    const text = renderCard(state);
+    if (!text) {
+      return;
+    }
+
+    sendStatusMessage(token, state.chatId, text, state.messageId).then(
+      (updatedId) => {
+        if (updatedId !== undefined) {
+          state.messageId = updatedId;
+        }
+      },
+      (err) => {
+        log.debug("Failed to update elapsed time", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      },
+    );
+  }, ELAPSED_INTERVAL_MS);
+}
+
+/**
+ * Re-render the card for a given chatId.
+ * Creates the pinned message if needed, or deletes it if nothing to show.
+ */
+async function rerender(token: string, state: ChatStatus): Promise<void> {
+  const hasWork = state.tasks.size > 0 || state.workingStartedAt !== undefined;
+
+  if (!hasWork) {
+    clearTimers(state);
+    await deleteStatusMessage(token, state);
+    statusByChatId.delete(state.chatId);
+    return;
+  }
+
+  const text = renderCard(state);
+  const msgId = await sendStatusMessage(token, state.chatId, text, state.messageId);
+  if (msgId !== undefined) {
+    state.messageId = msgId;
+  }
+
+  ensureElapsedTimer(token, state);
+}
+
+// ---------------------------------------------------------------------------
+// Timer helpers
+// ---------------------------------------------------------------------------
+
+function clearTimers(state: ChatStatus): void {
+  if (state.pendingTimer) {
+    clearTimeout(state.pendingTimer);
+    state.pendingTimer = undefined;
+  }
+  if (state.elapsedTimer) {
+    clearInterval(state.elapsedTimer);
+    state.elapsedTimer = undefined;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Programmatic API — trackTask / completeTask
+// ---------------------------------------------------------------------------
+
+function getOrCreateState(chatId: string): ChatStatus {
+  let state = statusByChatId.get(chatId);
+  if (!state) {
+    state = { chatId, tasks: new Map() };
+    statusByChatId.set(chatId, state);
+  }
+  return state;
+}
+
+/**
+ * Add a named task to the board for a given chatId.
+ * Immediately re-renders the pinned message.
+ */
+function trackTask(chatId: string, taskId: string, label: string): void {
+  const token = getBotToken();
+  if (!token) {
+    return;
+  }
+
+  const state = getOrCreateState(chatId);
+  state.tasks.set(taskId, { label, startedAt: new Date() });
+
+  rerender(token, state).catch((err) => {
+    log.debug("Failed to re-render after trackTask", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+}
+
+/**
+ * Remove a named task from the board (called when a task completes).
+ * Immediately re-renders the pinned message. If no tasks remain and
+ * no general working state is active, deletes the message.
+ */
+function completeTask(chatId: string, taskId: string): void {
+  const token = getBotToken();
+  if (!token) {
+    return;
+  }
+
+  const state = statusByChatId.get(chatId);
+  if (!state) {
+    return;
+  }
+
+  state.tasks.delete(taskId);
+
+  rerender(token, state).catch((err) => {
+    log.debug("Failed to re-render after completeTask", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Hook handler (message:received / message:sent)
 // ---------------------------------------------------------------------------
 
 const telegramStatusPinHandler: HookHandler = async (event) => {
@@ -181,61 +376,26 @@ const telegramStatusPinHandler: HookHandler = async (event) => {
   }
 };
 
-function clearTimers(state: StatusState): void {
+function handleReceived(token: string, chatId: string): void {
+  const state = getOrCreateState(chatId);
+
+  // Clear the pending timer (but NOT the elapsed timer — named tasks may
+  // already be updating it).
   if (state.pendingTimer) {
     clearTimeout(state.pendingTimer);
     state.pendingTimer = undefined;
   }
-  if (state.elapsedTimer) {
-    clearInterval(state.elapsedTimer);
-    state.elapsedTimer = undefined;
-  }
-}
 
-function handleReceived(token: string, chatId: string): void {
-  let state = statusByChatId.get(chatId);
-  if (!state) {
-    state = { chatId };
-    statusByChatId.set(chatId, state);
-  }
-
-  clearTimers(state);
-
-  state.startedAt = new Date();
-
-  // Only show status if no reply arrives within 15s
+  // Only show the generic "Working..." card if no reply arrives within 15s
   state.pendingTimer = setTimeout(() => {
     state.pendingTimer = undefined;
-    const startedAt = state.startedAt ?? new Date();
+    state.workingStartedAt = new Date();
 
-    sendStatusMessage(token, chatId, workingText(startedAt), state.messageId).then(
-      (msgId) => {
-        if (msgId !== undefined) {
-          state.messageId = msgId;
-        }
-
-        // Start updating elapsed time every 5s
-        state.elapsedTimer = setInterval(() => {
-          sendStatusMessage(token, chatId, workingText(startedAt), state.messageId).then(
-            (updatedId) => {
-              if (updatedId !== undefined) {
-                state.messageId = updatedId;
-              }
-            },
-            (err) => {
-              log.debug("Failed to update elapsed time", {
-                error: err instanceof Error ? err.message : String(err),
-              });
-            },
-          );
-        }, ELAPSED_INTERVAL_MS);
-      },
-      (err) => {
-        log.debug("Failed to send working status", {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      },
-    );
+    rerender(token, state).catch((err) => {
+      log.debug("Failed to send working status", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
   }, WORK_DELAY_MS);
 }
 
@@ -245,21 +405,32 @@ async function handleSent(token: string, chatId: string): Promise<void> {
     return;
   }
 
-  clearTimers(state);
-
-  if (state.messageId) {
-    await callTelegramApi(token, "deleteMessage", {
-      chat_id: chatId,
-      message_id: state.messageId,
-    }).catch(() => {
-      // Swallow delete failures silently
-    });
+  // Clear the pending "working" timer
+  if (state.pendingTimer) {
+    clearTimeout(state.pendingTimer);
+    state.pendingTimer = undefined;
   }
 
+  // Clear the general working state
+  state.workingStartedAt = undefined;
+
+  // If named tasks are still active, re-render without the general working
+  // line but keep the card alive for the tasks.
+  if (state.tasks.size > 0) {
+    await rerender(token, state);
+    return;
+  }
+
+  // No tasks and no working state — clean up entirely
+  clearTimers(state);
+  await deleteStatusMessage(token, state);
   statusByChatId.delete(chatId);
 }
 
 export default telegramStatusPinHandler;
 
+// Exported for programmatic use
+export { trackTask, completeTask };
+
 // Exported for testing
-export { statusByChatId, WORK_DELAY_MS, ELAPSED_INTERVAL_MS };
+export { statusByChatId, WORK_DELAY_MS, ELAPSED_INTERVAL_MS, renderCard };
