@@ -1,7 +1,14 @@
 import https from "node:https";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createHookEvent } from "../../hooks.js";
-import { statusByChatId, WORK_DELAY_MS } from "./handler.js";
+import {
+  statusByChatId,
+  WORK_DELAY_MS,
+  ELAPSED_INTERVAL_MS,
+  renderCard,
+  trackTask,
+  completeTask,
+} from "./handler.js";
 
 let handler: typeof import("./handler.js").default;
 
@@ -74,7 +81,17 @@ function mockHttpsRequest(responseBody: object = { ok: true, result: { message_i
   });
 }
 
+/** Extract the Telegram API method names from mock call history */
+function getCalledMethods(): string[] {
+  const calls = (https.request as ReturnType<typeof vi.fn>).mock.calls;
+  return calls.map((c: unknown[]) => (c[0] as { path: string }).path);
+}
+
 describe("telegram-status-pin hook", () => {
+  // -------------------------------------------------------------------
+  // Existing behaviour tests
+  // -------------------------------------------------------------------
+
   it("skips non-message events", async () => {
     const spy = vi.spyOn(https, "request");
     const event = createHookEvent("command", "new", "agent:main:main", {});
@@ -145,10 +162,9 @@ describe("telegram-status-pin hook", () => {
     await vi.advanceTimersByTimeAsync(100);
 
     // Should have called sendMessage + pinChatMessage
-    const calls = (https.request as ReturnType<typeof vi.fn>).mock.calls;
-    const methods = calls.map((c: unknown[]) => (c[0] as { path: string }).path);
-    expect(methods.some((m: string) => m.includes("sendMessage"))).toBe(true);
-    expect(methods.some((m: string) => m.includes("pinChatMessage"))).toBe(true);
+    const methods = getCalledMethods();
+    expect(methods.some((m) => m.includes("sendMessage"))).toBe(true);
+    expect(methods.some((m) => m.includes("pinChatMessage"))).toBe(true);
   });
 
   it("elapsed timer updates message text after initial send", async () => {
@@ -164,12 +180,11 @@ describe("telegram-status-pin hook", () => {
     mockHttpsRequest();
 
     // Advance by elapsed interval (5s) + flush microtasks
-    await vi.advanceTimersByTimeAsync(5_100);
+    await vi.advanceTimersByTimeAsync(ELAPSED_INTERVAL_MS + 100);
 
     // Should have called editMessageText to update elapsed time
-    const calls = (https.request as ReturnType<typeof vi.fn>).mock.calls;
-    const methods = calls.map((c: unknown[]) => (c[0] as { path: string }).path);
-    expect(methods.some((m: string) => m.includes("editMessageText"))).toBe(true);
+    const methods = getCalledMethods();
+    expect(methods.some((m) => m.includes("editMessageText"))).toBe(true);
   });
 
   it("handleSent cancels pending timer (no API call if reply is fast)", async () => {
@@ -198,7 +213,8 @@ describe("telegram-status-pin hook", () => {
     statusByChatId.set("5225642693", {
       chatId: "5225642693",
       messageId: 42,
-      startedAt: new Date(Date.now() - 20_000),
+      workingStartedAt: new Date(Date.now() - 20_000),
+      tasks: new Map(),
     });
 
     await handler(sentEvent("Here's your answer"));
@@ -230,10 +246,230 @@ describe("telegram-status-pin hook", () => {
     statusByChatId.set("5225642693", {
       chatId: "5225642693",
       messageId: 42,
-      startedAt: new Date(),
+      workingStartedAt: new Date(),
+      tasks: new Map(),
     });
 
     // Should not throw
     await expect(handler(sentEvent("Hello"))).resolves.toBeUndefined();
+  });
+
+  // -------------------------------------------------------------------
+  // Multi-task tracking tests
+  // -------------------------------------------------------------------
+
+  describe("trackTask", () => {
+    it("adds an entry and re-renders the card", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      trackTask("5225642693", "cc-1", "Claude Code: fix telegram hook");
+
+      // Flush microtasks for the async rerender
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Should have a state with the task
+      const state = statusByChatId.get("5225642693");
+      expect(state).toBeDefined();
+      expect(state!.tasks.has("cc-1")).toBe(true);
+      expect(state!.tasks.get("cc-1")!.label).toBe("Claude Code: fix telegram hook");
+
+      // Should have sent a message (sendMessage + pinChatMessage)
+      const methods = getCalledMethods();
+      expect(methods.some((m) => m.includes("sendMessage"))).toBe(true);
+    });
+
+    it("does nothing when bot token is missing", () => {
+      vi.stubEnv("TELEGRAM_BOT_TOKEN", "");
+      const spy = vi.spyOn(https, "request");
+
+      trackTask("5225642693", "cc-1", "Claude Code: test");
+
+      expect(spy).not.toHaveBeenCalled();
+      expect(statusByChatId.has("5225642693")).toBe(false);
+    });
+  });
+
+  describe("completeTask", () => {
+    it("removes an entry; if no tasks remain and no working state, deletes message", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      // Set up state with one task and a message
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        tasks: new Map([["cc-1", { label: "Claude Code: fix hook", startedAt: new Date() }]]),
+      });
+
+      completeTask("5225642693", "cc-1");
+
+      // Flush microtasks
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Should have called deleteMessage
+      const methods = getCalledMethods();
+      expect(methods.some((m) => m.includes("deleteMessage"))).toBe(true);
+
+      // State should be cleaned up
+      expect(statusByChatId.has("5225642693")).toBe(false);
+    });
+
+    it("keeps card alive when other tasks remain", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        tasks: new Map([
+          ["cc-1", { label: "Claude Code: fix hook", startedAt: new Date() }],
+          ["ws-1", { label: "Web search: Tailscale pricing", startedAt: new Date() }],
+        ]),
+      });
+
+      completeTask("5225642693", "cc-1");
+
+      // Flush microtasks
+      await vi.advanceTimersByTimeAsync(100);
+
+      // State should still exist with remaining task
+      const state = statusByChatId.get("5225642693");
+      expect(state).toBeDefined();
+      expect(state!.tasks.size).toBe(1);
+      expect(state!.tasks.has("ws-1")).toBe(true);
+
+      // Should have re-rendered (editMessageText), not deleted
+      const methods = getCalledMethods();
+      expect(methods.some((m) => m.includes("editMessageText"))).toBe(true);
+      expect(methods.some((m) => m.includes("deleteMessage"))).toBe(false);
+    });
+
+    it("keeps card alive when general working state is active even with no tasks", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        workingStartedAt: new Date(),
+        tasks: new Map([["cc-1", { label: "Claude Code: test", startedAt: new Date() }]]),
+      });
+
+      completeTask("5225642693", "cc-1");
+
+      // Flush microtasks
+      await vi.advanceTimersByTimeAsync(100);
+
+      // State should still exist (general working state active)
+      const state = statusByChatId.get("5225642693");
+      expect(state).toBeDefined();
+      expect(state!.tasks.size).toBe(0);
+
+      // Should have re-rendered, not deleted
+      const methods = getCalledMethods();
+      expect(methods.some((m) => m.includes("deleteMessage"))).toBe(false);
+    });
+
+    it("is a no-op for unknown chatId", () => {
+      const spy = vi.spyOn(https, "request");
+      completeTask("nonexistent", "cc-1");
+      expect(spy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("renderCard", () => {
+    it("renders multi-task card with all entries and elapsed times", () => {
+      vi.useFakeTimers({ now: new Date("2026-04-01T12:00:45Z") });
+
+      const state: typeof statusByChatId extends Map<string, infer V> ? V : never = {
+        chatId: "123",
+        tasks: new Map([
+          [
+            "cc-1",
+            {
+              label: "Claude Code: fix telegram hook",
+              startedAt: new Date("2026-04-01T12:00:00Z"),
+            },
+          ],
+          [
+            "ws-1",
+            { label: "Web search: Tailscale pricing", startedAt: new Date("2026-04-01T12:00:33Z") },
+          ],
+        ]),
+      };
+
+      const text = renderCard(state);
+
+      expect(text).toContain("\u2699\uFE0F K.I.T.T. is working...");
+      expect(text).toContain("\u2022 Claude Code: fix telegram hook (45s)");
+      expect(text).toContain("\u2022 Web search: Tailscale pricing (12s)");
+    });
+
+    it("renders general working state when no named tasks", () => {
+      vi.useFakeTimers({ now: new Date("2026-04-01T12:00:23Z") });
+
+      const state: typeof statusByChatId extends Map<string, infer V> ? V : never = {
+        chatId: "123",
+        workingStartedAt: new Date("2026-04-01T12:00:00Z"),
+        tasks: new Map(),
+      };
+
+      const text = renderCard(state);
+      expect(text).toBe("\u2699\uFE0F Working... (23s)");
+    });
+
+    it("omits elapsed for first few seconds of general working", () => {
+      vi.useFakeTimers({ now: new Date("2026-04-01T12:00:02Z") });
+
+      const state: typeof statusByChatId extends Map<string, infer V> ? V : never = {
+        chatId: "123",
+        workingStartedAt: new Date("2026-04-01T12:00:00Z"),
+        tasks: new Map(),
+      };
+
+      const text = renderCard(state);
+      expect(text).toBe("\u2699\uFE0F Working...");
+    });
+
+    it("formats elapsed time with minutes for longer durations", () => {
+      vi.useFakeTimers({ now: new Date("2026-04-01T12:02:15Z") });
+
+      const state: typeof statusByChatId extends Map<string, infer V> ? V : never = {
+        chatId: "123",
+        tasks: new Map([
+          [
+            "cc-1",
+            { label: "Claude Code: big refactor", startedAt: new Date("2026-04-01T12:00:00Z") },
+          ],
+        ]),
+      };
+
+      const text = renderCard(state);
+      expect(text).toContain("\u2022 Claude Code: big refactor (2m 15s)");
+    });
+  });
+
+  describe("handleSent with active named tasks", () => {
+    it("clears general working state but preserves named tasks", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      // State has both general working and a named task
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        workingStartedAt: new Date(),
+        tasks: new Map([["cc-1", { label: "Claude Code: build feature", startedAt: new Date() }]]),
+      });
+
+      await handler(sentEvent("Here's the answer"));
+
+      // State should still exist — named task is still active
+      const state = statusByChatId.get("5225642693");
+      expect(state).toBeDefined();
+      expect(state!.workingStartedAt).toBeUndefined();
+      expect(state!.tasks.size).toBe(1);
+    });
   });
 });
