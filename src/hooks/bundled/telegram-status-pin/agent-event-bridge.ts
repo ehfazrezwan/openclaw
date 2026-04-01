@@ -7,10 +7,10 @@
  */
 
 import { onAgentEvent, getAgentRunContext } from "../../../infra/agent-events.js";
-import { trackTask, completeTask } from "./handler.js";
+import { trackTask, completeTask, setCurrentAction, clearCurrentAction } from "./handler.js";
 
-// Tool names that are too noisy or internal to surface in the status card.
-const SKIP_TOOLS = new Set(["memory_search", "memory_get"]);
+/** Tools that create long-running persistent tasks (shown as bullet points). */
+const PERSISTENT_TOOLS = new Set(["sessions_spawn"]);
 
 function labelForTool(toolName: string, args: Record<string, unknown>): string {
   if (toolName === "sessions_spawn" && typeof args.task === "string") {
@@ -75,9 +75,6 @@ export function startAgentEventBridge(): () => void {
     }
 
     const toolName = String(name);
-    if (SKIP_TOOLS.has(toolName)) {
-      return;
-    }
 
     const context = getAgentRunContext(evt.runId);
     if (!context?.sessionKey) {
@@ -93,12 +90,21 @@ export function startAgentEventBridge(): () => void {
     }
 
     const taskId = `tool:${toolCallId}`;
+    const isPersistent = PERSISTENT_TOOLS.has(toolName);
 
     if (phase === "start") {
       const label = labelForTool(toolName, args ?? {});
-      trackTask(chatId, taskId, label);
+      if (isPersistent) {
+        trackTask(chatId, taskId, label);
+      } else {
+        setCurrentAction(chatId, taskId, label);
+      }
     } else if (phase === "end" || phase === "error") {
-      completeTask(chatId, taskId);
+      if (isPersistent) {
+        completeTask(chatId, taskId);
+      } else {
+        clearCurrentAction(chatId, taskId);
+      }
     }
   });
 }

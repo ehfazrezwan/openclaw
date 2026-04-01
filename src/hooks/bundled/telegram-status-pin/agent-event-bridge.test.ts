@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("./handler.js", () => ({
   trackTask: vi.fn(),
   completeTask: vi.fn(),
+  setCurrentAction: vi.fn(),
+  clearCurrentAction: vi.fn(),
 }));
 
 // Mock agent-events — capture the listener so we can fire events manually
@@ -20,7 +22,7 @@ vi.mock("../../../infra/agent-events.js", () => ({
 
 import { getAgentRunContext } from "../../../infra/agent-events.js";
 import { startAgentEventBridge, extractTelegramChatId } from "./agent-event-bridge.js";
-import { trackTask, completeTask } from "./handler.js";
+import { trackTask, completeTask, setCurrentAction, clearCurrentAction } from "./handler.js";
 
 const mockGetAgentRunContext = getAgentRunContext as ReturnType<typeof vi.fn>;
 
@@ -48,6 +50,8 @@ beforeEach(() => {
   mockUnsubscribe.mockClear();
   vi.mocked(trackTask).mockClear();
   vi.mocked(completeTask).mockClear();
+  vi.mocked(setCurrentAction).mockClear();
+  vi.mocked(clearCurrentAction).mockClear();
   mockGetAgentRunContext.mockReset();
 
   // Default: valid Telegram session with no heartbeat
@@ -74,55 +78,116 @@ describe("agent-event-bridge", () => {
     });
   });
 
-  describe("tool start events", () => {
-    it("calls trackTask with correct chatId and label", () => {
+  // -------------------------------------------------------------------
+  // Ephemeral tool routing
+  // -------------------------------------------------------------------
+
+  describe("ephemeral tool start events", () => {
+    it("calls setCurrentAction for ephemeral tools", () => {
       startAgentEventBridge();
       fireToolEvent();
+
+      expect(setCurrentAction).toHaveBeenCalledOnce();
+      expect(setCurrentAction).toHaveBeenCalledWith(
+        "5225642693",
+        "tool:tc-001",
+        "web_search: Tailscale pricing",
+      );
+      expect(trackTask).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("ephemeral tool end events", () => {
+    it("calls clearCurrentAction on phase=end", () => {
+      startAgentEventBridge();
+      fireToolEvent({ data: { phase: "end" } });
+
+      expect(clearCurrentAction).toHaveBeenCalledOnce();
+      expect(clearCurrentAction).toHaveBeenCalledWith("5225642693", "tool:tc-001");
+      expect(completeTask).not.toHaveBeenCalled();
+    });
+
+    it("calls clearCurrentAction on phase=error", () => {
+      startAgentEventBridge();
+      fireToolEvent({ data: { phase: "error" } });
+
+      expect(clearCurrentAction).toHaveBeenCalledOnce();
+      expect(clearCurrentAction).toHaveBeenCalledWith("5225642693", "tool:tc-001");
+      expect(completeTask).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Persistent tool routing (sessions_spawn)
+  // -------------------------------------------------------------------
+
+  describe("persistent tool start events", () => {
+    it("calls trackTask for sessions_spawn", () => {
+      startAgentEventBridge();
+      fireToolEvent({
+        data: {
+          name: "sessions_spawn",
+          args: { task: "Fix the authentication bug in the login flow" },
+        },
+      });
 
       expect(trackTask).toHaveBeenCalledOnce();
       expect(trackTask).toHaveBeenCalledWith(
         "5225642693",
         "tool:tc-001",
-        "web_search: Tailscale pricing",
+        "sessions_spawn: Fix the authentication bug in the login \u2026",
       );
+      expect(setCurrentAction).not.toHaveBeenCalled();
     });
   });
 
-  describe("tool end events", () => {
-    it("calls completeTask on phase=end", () => {
+  describe("persistent tool end events", () => {
+    it("calls completeTask for sessions_spawn on phase=end", () => {
       startAgentEventBridge();
-      fireToolEvent({ data: { phase: "end" } });
+      fireToolEvent({ data: { phase: "end", name: "sessions_spawn" } });
 
       expect(completeTask).toHaveBeenCalledOnce();
       expect(completeTask).toHaveBeenCalledWith("5225642693", "tool:tc-001");
+      expect(clearCurrentAction).not.toHaveBeenCalled();
     });
 
-    it("calls completeTask on phase=error", () => {
+    it("calls completeTask for sessions_spawn on phase=error", () => {
       startAgentEventBridge();
-      fireToolEvent({ data: { phase: "error" } });
+      fireToolEvent({ data: { phase: "error", name: "sessions_spawn" } });
 
       expect(completeTask).toHaveBeenCalledOnce();
       expect(completeTask).toHaveBeenCalledWith("5225642693", "tool:tc-001");
+      expect(clearCurrentAction).not.toHaveBeenCalled();
     });
   });
 
-  describe("SKIP_TOOLS filtering", () => {
-    it("ignores memory_search", () => {
+  // -------------------------------------------------------------------
+  // Previously-skipped tools are now ephemeral
+  // -------------------------------------------------------------------
+
+  describe("memory tools are now ephemeral (no longer skipped)", () => {
+    it("routes memory_search as ephemeral", () => {
       startAgentEventBridge();
       fireToolEvent({ data: { name: "memory_search" } });
 
+      expect(setCurrentAction).toHaveBeenCalledOnce();
+      expect(setCurrentAction).toHaveBeenCalledWith("5225642693", "tool:tc-001", "memory_search");
       expect(trackTask).not.toHaveBeenCalled();
-      expect(completeTask).not.toHaveBeenCalled();
     });
 
-    it("ignores memory_get", () => {
+    it("routes memory_get as ephemeral", () => {
       startAgentEventBridge();
       fireToolEvent({ data: { name: "memory_get" } });
 
+      expect(setCurrentAction).toHaveBeenCalledOnce();
+      expect(setCurrentAction).toHaveBeenCalledWith("5225642693", "tool:tc-001", "memory_get");
       expect(trackTask).not.toHaveBeenCalled();
-      expect(completeTask).not.toHaveBeenCalled();
     });
   });
+
+  // -------------------------------------------------------------------
+  // Filtering (non-telegram, heartbeat, missing data)
+  // -------------------------------------------------------------------
 
   describe("non-telegram session keys", () => {
     it("ignores whatsapp session keys", () => {
@@ -132,6 +197,7 @@ describe("agent-event-bridge", () => {
       startAgentEventBridge();
       fireToolEvent();
 
+      expect(setCurrentAction).not.toHaveBeenCalled();
       expect(trackTask).not.toHaveBeenCalled();
     });
 
@@ -142,6 +208,7 @@ describe("agent-event-bridge", () => {
       startAgentEventBridge();
       fireToolEvent();
 
+      expect(setCurrentAction).not.toHaveBeenCalled();
       expect(trackTask).not.toHaveBeenCalled();
     });
   });
@@ -155,6 +222,7 @@ describe("agent-event-bridge", () => {
       startAgentEventBridge();
       fireToolEvent();
 
+      expect(setCurrentAction).not.toHaveBeenCalled();
       expect(trackTask).not.toHaveBeenCalled();
     });
   });
@@ -165,6 +233,7 @@ describe("agent-event-bridge", () => {
       startAgentEventBridge();
       fireToolEvent();
 
+      expect(setCurrentAction).not.toHaveBeenCalled();
       expect(trackTask).not.toHaveBeenCalled();
     });
 
@@ -173,6 +242,7 @@ describe("agent-event-bridge", () => {
       startAgentEventBridge();
       fireToolEvent();
 
+      expect(setCurrentAction).not.toHaveBeenCalled();
       expect(trackTask).not.toHaveBeenCalled();
     });
   });
@@ -182,6 +252,7 @@ describe("agent-event-bridge", () => {
       startAgentEventBridge();
       fireToolEvent({ stream: "lifecycle" });
 
+      expect(setCurrentAction).not.toHaveBeenCalled();
       expect(trackTask).not.toHaveBeenCalled();
     });
 
@@ -189,9 +260,14 @@ describe("agent-event-bridge", () => {
       startAgentEventBridge();
       fireToolEvent({ stream: "assistant" });
 
+      expect(setCurrentAction).not.toHaveBeenCalled();
       expect(trackTask).not.toHaveBeenCalled();
     });
   });
+
+  // -------------------------------------------------------------------
+  // Label formatting
+  // -------------------------------------------------------------------
 
   describe("label formatting", () => {
     it("sessions_spawn includes task preview", () => {
@@ -219,7 +295,7 @@ describe("agent-event-bridge", () => {
         },
       });
 
-      expect(trackTask).toHaveBeenCalledWith(
+      expect(setCurrentAction).toHaveBeenCalledWith(
         "5225642693",
         "tool:tc-001",
         "exec: pnpm build && pnpm test --run",
@@ -235,7 +311,11 @@ describe("agent-event-bridge", () => {
         },
       });
 
-      expect(trackTask).toHaveBeenCalledWith("5225642693", "tool:tc-001", "exec: git status");
+      expect(setCurrentAction).toHaveBeenCalledWith(
+        "5225642693",
+        "tool:tc-001",
+        "exec: git status",
+      );
     });
 
     it("web_search includes query preview", () => {
@@ -247,7 +327,7 @@ describe("agent-event-bridge", () => {
         },
       });
 
-      expect(trackTask).toHaveBeenCalledWith(
+      expect(setCurrentAction).toHaveBeenCalledWith(
         "5225642693",
         "tool:tc-001",
         "web_search: How to configure Tailscale on Ubuntu",
@@ -263,7 +343,7 @@ describe("agent-event-bridge", () => {
         },
       });
 
-      expect(trackTask).toHaveBeenCalledWith(
+      expect(setCurrentAction).toHaveBeenCalledWith(
         "5225642693",
         "tool:tc-001",
         "web_fetch: https://docs.tailscale.com/kb/1234/install",
@@ -279,7 +359,7 @@ describe("agent-event-bridge", () => {
         },
       });
 
-      expect(trackTask).toHaveBeenCalledWith("5225642693", "tool:tc-001", "custom_tool");
+      expect(setCurrentAction).toHaveBeenCalledWith("5225642693", "tool:tc-001", "custom_tool");
     });
 
     it("truncates long sessions_spawn task preview at 40 chars", () => {
@@ -300,11 +380,16 @@ describe("agent-event-bridge", () => {
     });
   });
 
+  // -------------------------------------------------------------------
+  // Missing event data fields
+  // -------------------------------------------------------------------
+
   describe("missing event data fields", () => {
     it("ignores events with missing phase", () => {
       startAgentEventBridge();
       fireToolEvent({ data: { phase: undefined } });
 
+      expect(setCurrentAction).not.toHaveBeenCalled();
       expect(trackTask).not.toHaveBeenCalled();
     });
 
@@ -312,6 +397,7 @@ describe("agent-event-bridge", () => {
       startAgentEventBridge();
       fireToolEvent({ data: { name: undefined } });
 
+      expect(setCurrentAction).not.toHaveBeenCalled();
       expect(trackTask).not.toHaveBeenCalled();
     });
 
@@ -319,6 +405,7 @@ describe("agent-event-bridge", () => {
       startAgentEventBridge();
       fireToolEvent({ data: { toolCallId: undefined } });
 
+      expect(setCurrentAction).not.toHaveBeenCalled();
       expect(trackTask).not.toHaveBeenCalled();
     });
   });

@@ -44,8 +44,10 @@ interface ChatStatus {
   elapsedTimer?: ReturnType<typeof setInterval>;
   /** General "working" start time — set when pendingTimer fires */
   workingStartedAt?: Date;
-  /** Named tasks currently active */
+  /** Named tasks currently active (persistent tools like sessions_spawn) */
   tasks: Map<string, TaskEntry>;
+  /** Latest ephemeral tool action (replaces previous, never accumulates) */
+  currentAction?: { taskId: string; label: string; startedAt: Date };
 }
 
 const statusByChatId = new Map<string, ChatStatus>();
@@ -75,17 +77,30 @@ function formatElapsed(startedAt: Date): string {
 /**
  * Build the status card text from current state.
  *
- * - If named tasks exist, show each as a bullet with elapsed time.
- * - If only the general working state is active, show a single line.
+ * Two-tier rendering:
+ * - Persistent tasks (sessions_spawn): shown as bullet points that persist
+ * - Ephemeral current action: shown as a single line with wrench prefix
+ * - If neither exists, fall back to generic "Working..." line
  */
 function renderCard(state: ChatStatus): string {
   const lines: string[] = [];
+  const hasPersistentTasks = state.tasks.size > 0;
+  const hasCurrentAction = state.currentAction !== undefined;
 
-  if (state.tasks.size > 0) {
+  if (hasPersistentTasks || hasCurrentAction) {
     lines.push("\u2699\uFE0F K.I.T.T. is working...");
-    lines.push("");
-    for (const entry of state.tasks.values()) {
-      lines.push(`\u2022 ${entry.label} (${formatElapsed(entry.startedAt)})`);
+
+    if (hasPersistentTasks) {
+      lines.push("");
+      for (const entry of state.tasks.values()) {
+        lines.push(`\u2022 ${entry.label} (${formatElapsed(entry.startedAt)})`);
+      }
+    }
+
+    if (hasCurrentAction) {
+      lines.push(
+        `\uD83D\uDD27 ${state.currentAction!.label} (${formatElapsed(state.currentAction!.startedAt)})`,
+      );
     }
   } else if (state.workingStartedAt) {
     const elapsed = formatElapsed(state.workingStartedAt);
@@ -158,33 +173,33 @@ function callTelegramApi(
 
 async function sendStatusMessage(
   token: string,
-  chatId: string,
+  state: ChatStatus,
   text: string,
-  existingMessageId?: number,
 ): Promise<number | undefined> {
-  if (existingMessageId) {
+  if (state.messageId) {
     const res = await callTelegramApi(token, "editMessageText", {
-      chat_id: chatId,
-      message_id: existingMessageId,
+      chat_id: state.chatId,
+      message_id: state.messageId,
       text,
     });
     if (res.ok) {
-      return existingMessageId;
+      return state.messageId;
     }
     // If edit fails (message deleted etc.), fall through to send a new one
-    log.debug("editMessageText failed, sending new message", { chatId });
+    log.debug("editMessageText failed, sending new message", { chatId: state.chatId });
   }
 
   const res = await callTelegramApi(token, "sendMessage", {
-    chat_id: chatId,
+    chat_id: state.chatId,
     text,
     disable_notification: true,
   });
 
   const messageId = res.result?.message_id;
   if (res.ok && messageId) {
+    state.messageId = messageId;
     await callTelegramApi(token, "pinChatMessage", {
-      chat_id: chatId,
+      chat_id: state.chatId,
       message_id: messageId,
       disable_notification: true,
     });
@@ -221,18 +236,11 @@ function ensureElapsedTimer(token: string, state: ChatStatus): void {
       return;
     }
 
-    sendStatusMessage(token, state.chatId, text, state.messageId).then(
-      (updatedId) => {
-        if (updatedId !== undefined) {
-          state.messageId = updatedId;
-        }
-      },
-      (err) => {
-        log.debug("Failed to update elapsed time", {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      },
-    );
+    sendStatusMessage(token, state, text).catch((err) => {
+      log.debug("Failed to update elapsed time", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
   }, ELAPSED_INTERVAL_MS);
 }
 
@@ -240,8 +248,11 @@ function ensureElapsedTimer(token: string, state: ChatStatus): void {
  * Re-render the card for a given chatId.
  * Creates the pinned message if needed, or deletes it if nothing to show.
  */
-async function rerender(token: string, state: ChatStatus): Promise<void> {
-  const hasWork = state.tasks.size > 0 || state.workingStartedAt !== undefined;
+async function rerenderImpl(token: string, state: ChatStatus): Promise<void> {
+  const hasWork =
+    state.tasks.size > 0 ||
+    state.workingStartedAt !== undefined ||
+    state.currentAction !== undefined;
 
   if (!hasWork) {
     clearTimers(state);
@@ -251,12 +262,19 @@ async function rerender(token: string, state: ChatStatus): Promise<void> {
   }
 
   const text = renderCard(state);
-  const msgId = await sendStatusMessage(token, state.chatId, text, state.messageId);
-  if (msgId !== undefined) {
-    state.messageId = msgId;
-  }
-
+  await sendStatusMessage(token, state, text);
   ensureElapsedTimer(token, state);
+}
+
+/** Per-chatId mutex to prevent concurrent rerender race conditions. */
+const rerenderLocks = new Map<string, Promise<void>>();
+
+async function rerender(token: string, state: ChatStatus): Promise<void> {
+  const chatId = state.chatId;
+  const prev = rerenderLocks.get(chatId) ?? Promise.resolve();
+  const next = prev.then(() => rerenderImpl(token, state)).catch(() => {});
+  rerenderLocks.set(chatId, next);
+  await next;
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +326,7 @@ function trackTask(chatId: string, taskId: string, label: string): void {
 }
 
 /**
- * Remove a named task from the board (called when a task completes).
+ * Remove a named task from the board (called when a persistent task completes).
  * Immediately re-renders the pinned message. If no tasks remain and
  * no general working state is active, deletes the message.
  */
@@ -325,8 +343,72 @@ function completeTask(chatId: string, taskId: string): void {
 
   state.tasks.delete(taskId);
 
+  // Auto-delete immediately when nothing remains
+  if (state.tasks.size === 0 && !state.currentAction && !state.workingStartedAt) {
+    clearTimers(state);
+    deleteStatusMessage(token, state).catch(() => {});
+    statusByChatId.delete(chatId);
+    return;
+  }
+
   rerender(token, state).catch((err) => {
     log.debug("Failed to re-render after completeTask", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+}
+
+/**
+ * Set the current ephemeral action (replaces any previous one).
+ * Immediately re-renders the pinned card.
+ */
+function setCurrentAction(chatId: string, taskId: string, label: string): void {
+  const token = getBotToken();
+  if (!token) {
+    return;
+  }
+
+  const state = getOrCreateState(chatId);
+  state.currentAction = { taskId, label, startedAt: new Date() };
+
+  rerender(token, state).catch((err) => {
+    log.debug("Failed to re-render after setCurrentAction", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+}
+
+/**
+ * Clear the current ephemeral action, but only if taskId matches.
+ * A newer action that already replaced this one is left untouched.
+ */
+function clearCurrentAction(chatId: string, taskId: string): void {
+  const token = getBotToken();
+  if (!token) {
+    return;
+  }
+
+  const state = statusByChatId.get(chatId);
+  if (!state) {
+    return;
+  }
+
+  if (state.currentAction?.taskId !== taskId) {
+    return;
+  }
+
+  state.currentAction = undefined;
+
+  // Auto-delete immediately when nothing remains
+  if (state.tasks.size === 0 && !state.workingStartedAt) {
+    clearTimers(state);
+    deleteStatusMessage(token, state).catch(() => {});
+    statusByChatId.delete(chatId);
+    return;
+  }
+
+  rerender(token, state).catch((err) => {
+    log.debug("Failed to re-render after clearCurrentAction", {
       error: err instanceof Error ? err.message : String(err),
     });
   });
@@ -411,11 +493,12 @@ async function handleSent(token: string, chatId: string): Promise<void> {
     state.pendingTimer = undefined;
   }
 
-  // Clear the general working state
+  // Clear ephemeral state
   state.workingStartedAt = undefined;
+  state.currentAction = undefined;
 
-  // If named tasks are still active, re-render without the general working
-  // line but keep the card alive for the tasks.
+  // If persistent tasks are still active, re-render without the ephemeral
+  // lines but keep the card alive for the tasks.
   if (state.tasks.size > 0) {
     await rerender(token, state);
     return;
@@ -430,7 +513,7 @@ async function handleSent(token: string, chatId: string): Promise<void> {
 export default telegramStatusPinHandler;
 
 // Exported for programmatic use
-export { trackTask, completeTask };
+export { trackTask, completeTask, setCurrentAction, clearCurrentAction };
 
 // Exported for testing
-export { statusByChatId, WORK_DELAY_MS, ELAPSED_INTERVAL_MS, renderCard };
+export { statusByChatId, WORK_DELAY_MS, ELAPSED_INTERVAL_MS, renderCard, rerenderLocks };
