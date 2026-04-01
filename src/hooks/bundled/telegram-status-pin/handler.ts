@@ -28,7 +28,7 @@ const TELEGRAM_API_BASE = "https://api.telegram.org";
 const WORK_DELAY_MS = 15_000;
 const ELAPSED_INTERVAL_MS = 5_000;
 /** Maximum lifetime for a persistent task before auto-cleanup (safety net). */
-const TASK_TIMEOUT_MS = 30 * 60 * 1000;
+const TASK_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 /** Grace period after handleSent: force-clean orphaned tasks if still present. */
 const SENT_GRACE_MS = 5_000;
 
