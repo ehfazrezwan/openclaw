@@ -6,8 +6,11 @@ import {
   WORK_DELAY_MS,
   ELAPSED_INTERVAL_MS,
   renderCard,
+  rerenderLocks,
   trackTask,
   completeTask,
+  setCurrentAction,
+  clearCurrentAction,
 } from "./handler.js";
 
 let handler: typeof import("./handler.js").default;
@@ -15,6 +18,7 @@ let handler: typeof import("./handler.js").default;
 beforeEach(async () => {
   vi.stubEnv("TELEGRAM_BOT_TOKEN", "test-token-123");
   statusByChatId.clear();
+  rerenderLocks.clear();
   ({ default: handler } = await import("./handler.js"));
 });
 
@@ -28,6 +32,7 @@ afterEach(() => {
     }
   }
   statusByChatId.clear();
+  rerenderLocks.clear();
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   vi.useRealTimers();
@@ -255,7 +260,7 @@ describe("telegram-status-pin hook", () => {
   });
 
   // -------------------------------------------------------------------
-  // Multi-task tracking tests
+  // Persistent task tracking (trackTask / completeTask)
   // -------------------------------------------------------------------
 
   describe("trackTask", () => {
@@ -324,7 +329,7 @@ describe("telegram-status-pin hook", () => {
         messageId: 99,
         tasks: new Map([
           ["cc-1", { label: "Claude Code: fix hook", startedAt: new Date() }],
-          ["ws-1", { label: "Web search: Tailscale pricing", startedAt: new Date() }],
+          ["cc-2", { label: "sessions_spawn: Build feature", startedAt: new Date() }],
         ]),
       });
 
@@ -337,7 +342,7 @@ describe("telegram-status-pin hook", () => {
       const state = statusByChatId.get("5225642693");
       expect(state).toBeDefined();
       expect(state!.tasks.size).toBe(1);
-      expect(state!.tasks.has("ws-1")).toBe(true);
+      expect(state!.tasks.has("cc-2")).toBe(true);
 
       // Should have re-rendered (editMessageText), not deleted
       const methods = getCalledMethods();
@@ -345,14 +350,14 @@ describe("telegram-status-pin hook", () => {
       expect(methods.some((m) => m.includes("deleteMessage"))).toBe(false);
     });
 
-    it("keeps card alive when general working state is active even with no tasks", async () => {
+    it("keeps card alive when currentAction is active even with no tasks", async () => {
       vi.useFakeTimers();
       mockHttpsRequest();
 
       statusByChatId.set("5225642693", {
         chatId: "5225642693",
         messageId: 99,
-        workingStartedAt: new Date(),
+        currentAction: { taskId: "tool:tc-1", label: "web_search: test", startedAt: new Date() },
         tasks: new Map([["cc-1", { label: "Claude Code: test", startedAt: new Date() }]]),
       });
 
@@ -361,10 +366,11 @@ describe("telegram-status-pin hook", () => {
       // Flush microtasks
       await vi.advanceTimersByTimeAsync(100);
 
-      // State should still exist (general working state active)
+      // State should still exist (currentAction active)
       const state = statusByChatId.get("5225642693");
       expect(state).toBeDefined();
       expect(state!.tasks.size).toBe(0);
+      expect(state!.currentAction).toBeDefined();
 
       // Should have re-rendered, not deleted
       const methods = getCalledMethods();
@@ -378,8 +384,131 @@ describe("telegram-status-pin hook", () => {
     });
   });
 
+  // -------------------------------------------------------------------
+  // Ephemeral action tracking (setCurrentAction / clearCurrentAction)
+  // -------------------------------------------------------------------
+
+  describe("setCurrentAction", () => {
+    it("sets the current action and re-renders", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      setCurrentAction("5225642693", "tool:tc-1", "web_search: OpenClaw pricing");
+
+      await vi.advanceTimersByTimeAsync(100);
+
+      const state = statusByChatId.get("5225642693");
+      expect(state).toBeDefined();
+      expect(state!.currentAction).toBeDefined();
+      expect(state!.currentAction!.taskId).toBe("tool:tc-1");
+      expect(state!.currentAction!.label).toBe("web_search: OpenClaw pricing");
+
+      const methods = getCalledMethods();
+      expect(methods.some((m) => m.includes("sendMessage"))).toBe(true);
+    });
+
+    it("replaces the previous ephemeral action", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      setCurrentAction("5225642693", "tool:tc-1", "web_search: first");
+      await vi.advanceTimersByTimeAsync(100);
+
+      setCurrentAction("5225642693", "tool:tc-2", "exec: grep foo");
+      await vi.advanceTimersByTimeAsync(100);
+
+      const state = statusByChatId.get("5225642693");
+      expect(state!.currentAction!.taskId).toBe("tool:tc-2");
+      expect(state!.currentAction!.label).toBe("exec: grep foo");
+    });
+
+    it("does nothing when bot token is missing", () => {
+      vi.stubEnv("TELEGRAM_BOT_TOKEN", "");
+      const spy = vi.spyOn(https, "request");
+
+      setCurrentAction("5225642693", "tool:tc-1", "web_search: test");
+
+      expect(spy).not.toHaveBeenCalled();
+      expect(statusByChatId.has("5225642693")).toBe(false);
+    });
+  });
+
+  describe("clearCurrentAction", () => {
+    it("clears the action when taskId matches", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      // Set up state with a currentAction and a persistent task
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        currentAction: { taskId: "tool:tc-1", label: "web_search: test", startedAt: new Date() },
+        tasks: new Map([["cc-1", { label: "sessions_spawn: Fix bug", startedAt: new Date() }]]),
+      });
+
+      clearCurrentAction("5225642693", "tool:tc-1");
+      await vi.advanceTimersByTimeAsync(100);
+
+      const state = statusByChatId.get("5225642693");
+      expect(state).toBeDefined();
+      expect(state!.currentAction).toBeUndefined();
+      // Persistent task should remain
+      expect(state!.tasks.size).toBe(1);
+    });
+
+    it("does not clear when taskId does not match (newer action replaced it)", () => {
+      mockHttpsRequest();
+
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        currentAction: { taskId: "tool:tc-2", label: "exec: grep bar", startedAt: new Date() },
+        tasks: new Map(),
+      });
+
+      // Try to clear with the OLD taskId — should be a no-op
+      clearCurrentAction("5225642693", "tool:tc-1");
+
+      const state = statusByChatId.get("5225642693");
+      expect(state!.currentAction).toBeDefined();
+      expect(state!.currentAction!.taskId).toBe("tool:tc-2");
+    });
+
+    it("auto-deletes card when clearing the last action with no persistent tasks", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        currentAction: { taskId: "tool:tc-1", label: "web_search: test", startedAt: new Date() },
+        tasks: new Map(),
+      });
+
+      clearCurrentAction("5225642693", "tool:tc-1");
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Should have deleted the message
+      const methods = getCalledMethods();
+      expect(methods.some((m) => m.includes("deleteMessage"))).toBe(true);
+
+      // State should be cleaned up
+      expect(statusByChatId.has("5225642693")).toBe(false);
+    });
+
+    it("is a no-op for unknown chatId", () => {
+      const spy = vi.spyOn(https, "request");
+      clearCurrentAction("nonexistent", "tool:tc-1");
+      expect(spy).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // renderCard
+  // -------------------------------------------------------------------
+
   describe("renderCard", () => {
-    it("renders multi-task card with all entries and elapsed times", () => {
+    it("renders persistent tasks as bullet points", () => {
       vi.useFakeTimers({ now: new Date("2026-04-01T12:00:45Z") });
 
       const state: typeof statusByChatId extends Map<string, infer V> ? V : never = {
@@ -392,10 +521,6 @@ describe("telegram-status-pin hook", () => {
               startedAt: new Date("2026-04-01T12:00:00Z"),
             },
           ],
-          [
-            "ws-1",
-            { label: "Web search: Tailscale pricing", startedAt: new Date("2026-04-01T12:00:33Z") },
-          ],
         ]),
       };
 
@@ -403,10 +528,57 @@ describe("telegram-status-pin hook", () => {
 
       expect(text).toContain("\u2699\uFE0F K.I.T.T. is working...");
       expect(text).toContain("\u2022 Claude Code: fix telegram hook (45s)");
-      expect(text).toContain("\u2022 Web search: Tailscale pricing (12s)");
     });
 
-    it("renders general working state when no named tasks", () => {
+    it("renders both persistent tasks and ephemeral action", () => {
+      vi.useFakeTimers({ now: new Date("2026-04-01T12:02:15Z") });
+
+      const state: typeof statusByChatId extends Map<string, infer V> ? V : never = {
+        chatId: "123",
+        tasks: new Map([
+          [
+            "cc-1",
+            {
+              label: "Claude Code: Fix the auth bug",
+              startedAt: new Date("2026-04-01T12:00:00Z"),
+            },
+          ],
+        ]),
+        currentAction: {
+          taskId: "tool:tc-1",
+          label: "web_search: OpenClaw pricing",
+          startedAt: new Date("2026-04-01T12:02:12Z"),
+        },
+      };
+
+      const text = renderCard(state);
+
+      expect(text).toContain("\u2699\uFE0F K.I.T.T. is working...");
+      expect(text).toContain("\u2022 Claude Code: Fix the auth bug (2m 15s)");
+      expect(text).toContain("\uD83D\uDD27 web_search: OpenClaw pricing (3s)");
+    });
+
+    it("renders only ephemeral action without blank line", () => {
+      vi.useFakeTimers({ now: new Date("2026-04-01T12:00:12Z") });
+
+      const state: typeof statusByChatId extends Map<string, infer V> ? V : never = {
+        chatId: "123",
+        tasks: new Map(),
+        currentAction: {
+          taskId: "tool:tc-1",
+          label: 'exec: grep -n -i "sharepoint"',
+          startedAt: new Date("2026-04-01T12:00:00Z"),
+        },
+      };
+
+      const text = renderCard(state);
+
+      expect(text).toBe(
+        '\u2699\uFE0F K.I.T.T. is working...\n\uD83D\uDD27 exec: grep -n -i "sharepoint" (12s)',
+      );
+    });
+
+    it("renders general working state when no named tasks or actions", () => {
       vi.useFakeTimers({ now: new Date("2026-04-01T12:00:23Z") });
 
       const state: typeof statusByChatId extends Map<string, infer V> ? V : never = {
@@ -450,26 +622,117 @@ describe("telegram-status-pin hook", () => {
     });
   });
 
+  // -------------------------------------------------------------------
+  // handleSent with active tasks
+  // -------------------------------------------------------------------
+
   describe("handleSent with active named tasks", () => {
-    it("clears general working state but preserves named tasks", async () => {
+    it("clears ephemeral state but preserves persistent tasks", async () => {
       vi.useFakeTimers();
       mockHttpsRequest();
 
-      // State has both general working and a named task
+      // State has both general working, an ephemeral action, and a persistent task
       statusByChatId.set("5225642693", {
         chatId: "5225642693",
         messageId: 99,
         workingStartedAt: new Date(),
+        currentAction: { taskId: "tool:tc-1", label: "web_search: test", startedAt: new Date() },
         tasks: new Map([["cc-1", { label: "Claude Code: build feature", startedAt: new Date() }]]),
       });
 
       await handler(sentEvent("Here's the answer"));
 
-      // State should still exist — named task is still active
+      // Flush microtasks for the rerender
+      await vi.advanceTimersByTimeAsync(100);
+
+      // State should still exist — persistent task is still active
       const state = statusByChatId.get("5225642693");
       expect(state).toBeDefined();
       expect(state!.workingStartedAt).toBeUndefined();
+      expect(state!.currentAction).toBeUndefined();
       expect(state!.tasks.size).toBe(1);
+    });
+
+    it("deletes card when handleSent fires with no persistent tasks", async () => {
+      mockHttpsRequest();
+
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        currentAction: { taskId: "tool:tc-1", label: "web_search: test", startedAt: new Date() },
+        tasks: new Map(),
+      });
+
+      await handler(sentEvent("Here's your answer"));
+
+      // State should be cleared entirely
+      expect(statusByChatId.has("5225642693")).toBe(false);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Auto-deletion when last persistent task completes
+  // -------------------------------------------------------------------
+
+  describe("card auto-deletion", () => {
+    it("auto-deletes when last persistent task completes and no currentAction", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        tasks: new Map([["cc-1", { label: "Claude Code: fix hook", startedAt: new Date() }]]),
+      });
+
+      completeTask("5225642693", "cc-1");
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(statusByChatId.has("5225642693")).toBe(false);
+      const methods = getCalledMethods();
+      expect(methods.some((m) => m.includes("deleteMessage"))).toBe(true);
+    });
+
+    it("auto-deletes when clearCurrentAction empties all state", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      statusByChatId.set("5225642693", {
+        chatId: "5225642693",
+        messageId: 99,
+        currentAction: { taskId: "tool:tc-1", label: "exec: test", startedAt: new Date() },
+        tasks: new Map(),
+      });
+
+      clearCurrentAction("5225642693", "tool:tc-1");
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(statusByChatId.has("5225642693")).toBe(false);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Mutex prevents concurrent sendMessage calls
+  // -------------------------------------------------------------------
+
+  describe("rerender mutex", () => {
+    it("serializes concurrent rerenders to prevent duplicate sendMessage calls", async () => {
+      vi.useFakeTimers();
+      mockHttpsRequest();
+
+      // Fire two trackTask calls rapidly — without mutex both would see
+      // messageId=undefined and both call sendMessage
+      trackTask("5225642693", "cc-1", "Task 1");
+      trackTask("5225642693", "cc-2", "Task 2");
+
+      // Flush all microtasks
+      await vi.advanceTimersByTimeAsync(200);
+
+      // Count sendMessage calls — should be exactly 1 (second rerender
+      // should use editMessageText since mutex ensures first completes first)
+      const methods = getCalledMethods();
+      const sendMessageCalls = methods.filter((m) => m.includes("/sendMessage"));
+      expect(sendMessageCalls.length).toBe(1);
     });
   });
 });
