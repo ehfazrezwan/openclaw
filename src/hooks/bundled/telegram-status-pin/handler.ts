@@ -40,6 +40,8 @@ interface TaskEntry {
 interface ChatStatus {
   chatId: string;
   messageId?: number;
+  /** True while a sendMessage call is in-flight (prevents duplicate creates) */
+  sendInFlight?: boolean;
   pendingTimer?: ReturnType<typeof setTimeout>;
   elapsedTimer?: ReturnType<typeof setInterval>;
   /** General "working" start time — set when pendingTimer fires */
@@ -189,24 +191,34 @@ async function sendStatusMessage(
     log.debug("editMessageText failed, sending new message", { chatId: state.chatId });
   }
 
-  const res = await callTelegramApi(token, "sendMessage", {
-    chat_id: state.chatId,
-    text,
-    disable_notification: true,
-  });
-
-  const messageId = res.result?.message_id;
-  if (res.ok && messageId) {
-    state.messageId = messageId;
-    await callTelegramApi(token, "pinChatMessage", {
-      chat_id: state.chatId,
-      message_id: messageId,
-      disable_notification: true,
-    });
-    return messageId;
+  // Guard: if another call is already creating a new message, skip to avoid duplicates
+  if (state.sendInFlight) {
+    return undefined;
   }
 
-  return undefined;
+  state.sendInFlight = true;
+  try {
+    const res = await callTelegramApi(token, "sendMessage", {
+      chat_id: state.chatId,
+      text,
+      disable_notification: true,
+    });
+
+    const messageId = res.result?.message_id;
+    if (res.ok && messageId) {
+      state.messageId = messageId;
+      await callTelegramApi(token, "pinChatMessage", {
+        chat_id: state.chatId,
+        message_id: messageId,
+        disable_notification: true,
+      });
+      return messageId;
+    }
+
+    return undefined;
+  } finally {
+    state.sendInFlight = false;
+  }
 }
 
 async function deleteStatusMessage(token: string, state: ChatStatus): Promise<void> {
