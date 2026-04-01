@@ -29,6 +29,8 @@ const WORK_DELAY_MS = 15_000;
 const ELAPSED_INTERVAL_MS = 5_000;
 /** Maximum lifetime for a persistent task before auto-cleanup (safety net). */
 const TASK_TIMEOUT_MS = 30 * 60 * 1000;
+/** Grace period after handleSent: force-clean orphaned tasks if still present. */
+const SENT_GRACE_MS = 5_000;
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -54,6 +56,8 @@ interface ChatStatus {
   tasks: Map<string, TaskEntry>;
   /** Latest ephemeral tool action (replaces previous, never accumulates) */
   currentAction?: { taskId: string; label: string; startedAt: Date };
+  /** Grace timer: force-cleans orphaned tasks shortly after handleSent */
+  sentGraceTimer?: ReturnType<typeof setTimeout>;
 }
 
 const statusByChatId = new Map<string, ChatStatus>();
@@ -308,6 +312,10 @@ function clearTimers(state: ChatStatus): void {
       task.timeoutTimer = undefined;
     }
   }
+  if (state.sentGraceTimer) {
+    clearTimeout(state.sentGraceTimer);
+    state.sentGraceTimer = undefined;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +381,12 @@ function completeTask(chatId: string, taskId: string): void {
   }
 
   state.tasks.delete(taskId);
+
+  // Clear the sent grace timer — task completed normally
+  if (state.sentGraceTimer) {
+    clearTimeout(state.sentGraceTimer);
+    state.sentGraceTimer = undefined;
+  }
 
   // Auto-delete immediately when nothing remains
   if (state.tasks.size === 0 && !state.currentAction && !state.workingStartedAt) {
@@ -529,8 +543,33 @@ async function handleSent(token: string, chatId: string): Promise<void> {
   state.currentAction = undefined;
 
   // If persistent tasks are still active, re-render without the ephemeral
-  // lines but keep the card alive for the tasks.
+  // lines but keep the card alive for the tasks — but set a grace timer
+  // to force-clean orphaned tasks if completeTask never arrives.
   if (state.tasks.size > 0) {
+    if (state.sentGraceTimer) {
+      clearTimeout(state.sentGraceTimer);
+    }
+    state.sentGraceTimer = setTimeout(() => {
+      state.sentGraceTimer = undefined;
+      // If tasks are still present, they're orphaned — force-clean them
+      if (state.tasks.size > 0) {
+        log.debug("Sent grace period expired — force-cleaning orphaned tasks", {
+          chatId,
+          taskCount: state.tasks.size,
+        });
+        // Clear all task timeout timers before wiping the map
+        for (const task of state.tasks.values()) {
+          if (task.timeoutTimer) {
+            clearTimeout(task.timeoutTimer);
+          }
+        }
+        state.tasks.clear();
+        clearTimers(state);
+        deleteStatusMessage(token, state).catch(() => {});
+        statusByChatId.delete(chatId);
+      }
+    }, SENT_GRACE_MS);
+
     await rerender(token, state);
     return;
   }
@@ -552,6 +591,7 @@ export {
   WORK_DELAY_MS,
   ELAPSED_INTERVAL_MS,
   TASK_TIMEOUT_MS,
+  SENT_GRACE_MS,
   renderCard,
   rerenderLocks,
 };
