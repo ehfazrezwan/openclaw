@@ -1,6 +1,6 @@
 ---
 name: telegram-status-pin
-description: "Maintain a pinned Telegram status message showing real-time agent progress"
+description: "Maintain a pinned Telegram status card showing real-time agent progress and active tasks"
 homepage: https://docs.openclaw.ai/automation/hooks#telegram-status-pin
 metadata:
   {
@@ -15,47 +15,54 @@ metadata:
 
 # Telegram Status Pin Hook
 
-Maintains a single pinned status message in Telegram chats that shows real-time progress when the agent is working on long-running tasks.
+Maintains a single pinned status message in Telegram chats that functions as a live task board, showing real-time progress when the agent is working.
 
 ## What It Does
 
+### Hook-driven behaviour (message events)
+
 When the user sends a message (`message:received`):
 
-1. **Starts a 3-second timer** — avoids flicker for instant responses
-2. **If agent hasn't replied within 3s** — sends/edits a pinned status message to show "Working..."
-3. **Tracks start time** for duration calculation
+1. **Starts a 15-second timer** — avoids flicker for instant responses
+2. **If agent hasn't replied within 15s** — sends/edits a pinned status card showing "Working..."
+3. **Updates elapsed time** every 5 seconds
 
 When the agent replies (`message:sent`):
 
-1. **Cancels the pending timer** if the agent replied within 3s
-2. **Updates status to "Done"** with the elapsed duration
-3. **After 10s of idle** — switches to "Standby" state
+1. **Cancels the pending timer** if the agent replied within 15s
+2. **Deletes the status card** — unless named tasks are still active
 
-## Status Message States
+### Programmatic API (multi-task tracking)
 
-**Working:**
+The hook exports two functions that can be called from other parts of the system:
 
-```
-⚙️ K.I.T.T. — Working
-──────────────────────
-⏳ Processing your request...
-Started: 17:23:14
-```
+```ts
+import { trackTask, completeTask } from "./handler.js";
 
-**Ready:**
+// Add a named task to the board
+trackTask("5225642693", "cc-1", "Claude Code: fix telegram hook");
 
-```
-⚙️ K.I.T.T. — Ready
-──────────────────────
-✅ Last response: 2s ago
+// Remove a task when it completes
+completeTask("5225642693", "cc-1");
 ```
 
-**Standby:**
+Both functions immediately re-render the pinned card. When no tasks remain and no general working state is active, the card is deleted.
+
+## Status Card Formats
+
+**Multiple named tasks active:**
 
 ```
-⚙️ K.I.T.T. — Standby
-──────────────────────
-💤 Waiting for input
+⚙️ K.I.T.T. is working...
+
+• Claude Code: fix telegram hook (45s)
+• Web search: Tailscale pricing (12s)
+```
+
+**General working state (no named tasks, 15s timer fired):**
+
+```
+⚙️ Working... (23s)
 ```
 
 ## Requirements
