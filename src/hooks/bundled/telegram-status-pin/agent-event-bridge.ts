@@ -110,7 +110,7 @@ export function startAgentEventBridge(): () => void {
       } else {
         setCurrentAction(chatId, taskId, label);
       }
-    } else if (phase === "end" || phase === "error") {
+    } else if (phase === "end" || phase === "result" || phase === "error") {
       // First try the stored mapping (reliable even after run context cleanup).
       // Fall back to getAgentRunContext for backward compatibility.
       const stored = taskChatIdMap.get(toolCallId);
