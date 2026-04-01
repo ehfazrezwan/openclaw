@@ -16,6 +16,7 @@ import type { CliDeps } from "../cli/deps.js";
 import type { loadConfig } from "../config/config.js";
 import { resolveAgentModelPrimaryValue } from "../config/model-input.js";
 import { resolveStateDir } from "../config/paths.js";
+import { startAgentEventBridge } from "../hooks/bundled/telegram-status-pin/agent-event-bridge.js";
 import { startGmailWatcherWithLogs } from "../hooks/gmail-watcher-lifecycle.js";
 import {
   clearInternalHooks,
@@ -145,6 +146,10 @@ export async function startGatewaySidecars(params: {
   } catch (err) {
     params.logHooks.error(`failed to load hooks: ${String(err)}`);
   }
+
+  // Start the agent-event bridge so the telegram-status-pin card
+  // reflects which tools are currently executing.
+  startAgentEventBridge();
 
   // Launch configured channels so gateway replies via the surface the message came from.
   // Tests can opt out via OPENCLAW_SKIP_CHANNELS (or legacy OPENCLAW_SKIP_PROVIDERS).
