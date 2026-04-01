@@ -12,6 +12,13 @@ import { trackTask, completeTask, setCurrentAction, clearCurrentAction } from ".
 /** Tools that create long-running persistent tasks (shown as bullet points). */
 const PERSISTENT_TOOLS = new Set(["sessions_spawn"]);
 
+/**
+ * Maps toolCallId → { chatId, isPersistent } so that tool:end events can
+ * resolve the correct chatId even when the agent run context has already been
+ * cleaned up (the root cause of orphaned pinned status cards).
+ */
+const taskChatIdMap = new Map<string, { chatId: string; isPersistent: boolean }>();
+
 function labelForTool(toolName: string, args: Record<string, unknown>): string {
   if (toolName === "sessions_spawn" && typeof args.task === "string") {
     const preview = args.task.slice(0, 40).replace(/\n/g, " ");
@@ -75,24 +82,28 @@ export function startAgentEventBridge(): () => void {
     }
 
     const toolName = String(name);
-
-    const context = getAgentRunContext(evt.runId);
-    if (!context?.sessionKey) {
-      return;
-    }
-    if (context.isHeartbeat) {
-      return;
-    }
-
-    const chatId = extractTelegramChatId(context.sessionKey);
-    if (!chatId) {
-      return;
-    }
-
     const taskId = `tool:${toolCallId}`;
     const isPersistent = PERSISTENT_TOOLS.has(toolName);
 
     if (phase === "start") {
+      // Resolve chatId from agent run context (available at start time)
+      const context = getAgentRunContext(evt.runId);
+      if (!context?.sessionKey) {
+        return;
+      }
+      if (context.isHeartbeat) {
+        return;
+      }
+
+      const chatId = extractTelegramChatId(context.sessionKey);
+      if (!chatId) {
+        return;
+      }
+
+      // Store the mapping so tool:end can find the chatId even if the
+      // agent run context has been cleaned up by then.
+      taskChatIdMap.set(toolCallId, { chatId, isPersistent });
+
       const label = labelForTool(toolName, args ?? {});
       if (isPersistent) {
         trackTask(chatId, taskId, label);
@@ -100,7 +111,32 @@ export function startAgentEventBridge(): () => void {
         setCurrentAction(chatId, taskId, label);
       }
     } else if (phase === "end" || phase === "error") {
-      if (isPersistent) {
+      // First try the stored mapping (reliable even after run context cleanup).
+      // Fall back to getAgentRunContext for backward compatibility.
+      const stored = taskChatIdMap.get(toolCallId);
+      let chatId: string | null = null;
+      let resolvedPersistent = isPersistent;
+
+      if (stored) {
+        chatId = stored.chatId;
+        resolvedPersistent = stored.isPersistent;
+        taskChatIdMap.delete(toolCallId);
+      } else {
+        const context = getAgentRunContext(evt.runId);
+        if (!context?.sessionKey) {
+          return;
+        }
+        if (context.isHeartbeat) {
+          return;
+        }
+        chatId = extractTelegramChatId(context.sessionKey);
+      }
+
+      if (!chatId) {
+        return;
+      }
+
+      if (resolvedPersistent) {
         completeTask(chatId, taskId);
       } else {
         clearCurrentAction(chatId, taskId);
@@ -108,3 +144,6 @@ export function startAgentEventBridge(): () => void {
     }
   });
 }
+
+// Exported for testing
+export { taskChatIdMap };
