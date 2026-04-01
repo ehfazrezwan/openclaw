@@ -12,7 +12,13 @@
  */
 
 import { onAgentEvent, getAgentRunContext } from "../../../infra/agent-events.js";
-import { trackTask, completeTask, setCurrentAction, clearCurrentAction } from "./handler.js";
+import {
+  trackTask,
+  completeTask,
+  setCurrentAction,
+  clearCurrentAction,
+  handleRunEnd,
+} from "./handler.js";
 
 /** Tools that create long-running persistent tasks (shown as bullet points). */
 const PERSISTENT_TOOLS = new Set(["sessions_spawn"]);
@@ -100,16 +106,28 @@ function extractChildRunId(result: unknown): string | null {
 
 export function startAgentEventBridge(): () => void {
   return onAgentEvent((evt) => {
-    // Handle lifecycle events for child run completion detection.
-    // When a persistent tool (sessions_spawn) spawns a background session,
-    // we defer completeTask until the child run ends.
+    // Handle lifecycle events for child run completion detection AND
+    // parent run-end cleanup (secondary path for NO_REPLY / silent replies).
     if (evt.stream === "lifecycle") {
       const { phase } = evt.data as { phase?: string };
       if (phase === "end" || phase === "error") {
+        // 1. Child run completion — completes a persistent task (sessions_spawn)
         const pending = pendingRunCompletions.get(evt.runId);
         if (pending) {
           pendingRunCompletions.delete(evt.runId);
           completeTask(pending.chatId, pending.taskId);
+        }
+
+        // 2. Parent run-end cleanup — clears the "Working..." card when
+        //    message:sent never fires (e.g. NO_REPLY / silent reply).
+        //    handleRunEnd is idempotent: if handleSent already cleaned up,
+        //    this is a no-op.
+        const context = getAgentRunContext(evt.runId);
+        if (context?.sessionKey && !context.isHeartbeat) {
+          const chatId = extractTelegramChatId(context.sessionKey);
+          if (chatId) {
+            handleRunEnd(chatId);
+          }
         }
       }
       return;
