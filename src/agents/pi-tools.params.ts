@@ -4,12 +4,46 @@ export type RequiredParamGroup = {
   keys: readonly string[];
   allowEmpty?: boolean;
   label?: string;
+  validator?: (record: Record<string, unknown>) => boolean;
 };
 
 const RETRY_GUIDANCE_SUFFIX = " Supply correct parameters before retrying.";
 
 function parameterValidationError(message: string): Error {
   return new Error(`${message}.${RETRY_GUIDANCE_SUFFIX}`);
+}
+
+function describeReceivedParamValue(value: unknown, allowEmpty = false): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value === "string") {
+    if (allowEmpty || value.trim().length > 0) {
+      return undefined;
+    }
+    return "<empty-string>";
+  }
+  if (Array.isArray(value)) {
+    return "<array>";
+  }
+  return `<${typeof value}>`;
+}
+
+function formatReceivedParamHint(
+  record: Record<string, unknown>,
+  groups: readonly RequiredParamGroup[],
+): string {
+  const allowEmptyKeys = new Set(
+    groups.filter((group) => group.allowEmpty).flatMap((group) => group.keys),
+  );
+  const received = Object.keys(record).flatMap((key) => {
+    const detail = describeReceivedParamValue(record[key], allowEmptyKeys.has(key));
+    if (record[key] === undefined || record[key] === null) {
+      return [];
+    }
+    return [detail ? `${key}=${detail}` : key];
+  });
+  return received.length > 0 ? ` (received: ${received.join(", ")})` : "";
 }
 
 export const CLAUDE_PARAM_GROUPS = {
@@ -23,11 +57,13 @@ export const CLAUDE_PARAM_GROUPS = {
     {
       keys: ["oldText", "old_string", "old_text", "oldString"],
       label: "oldText alias",
+      validator: hasValidEditReplacements,
     },
     {
       keys: ["newText", "new_string", "new_text", "newString"],
       label: "newText alias",
       allowEmpty: true,
+      validator: hasValidEditReplacements,
     },
   ],
 } as const;
@@ -48,6 +84,11 @@ const CLAUDE_PARAM_ALIASES: ClaudeParamAlias[] = [
   { original: "newText", alias: "new_text" },
   { original: "newText", alias: "newString" },
 ];
+
+type EditReplacement = {
+  oldText: string;
+  newText: string;
+};
 
 function extractStructuredText(value: unknown, depth = 0): string | undefined {
   if (depth > 6) {
@@ -99,6 +140,58 @@ function normalizeTextLikeParam(record: Record<string, unknown>, key: string) {
   }
 }
 
+function normalizeEditReplacement(value: unknown): EditReplacement | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const normalized = { ...(value as Record<string, unknown>) };
+  normalizeClaudeParamAliases(normalized);
+  normalizeTextLikeParam(normalized, "oldText");
+  normalizeTextLikeParam(normalized, "newText");
+  if (typeof normalized.oldText !== "string" || normalized.oldText.trim().length === 0) {
+    return undefined;
+  }
+  if (typeof normalized.newText !== "string") {
+    return undefined;
+  }
+  return {
+    oldText: normalized.oldText,
+    newText: normalized.newText,
+  };
+}
+
+function normalizeEditReplacements(record: Record<string, unknown>) {
+  const replacements: EditReplacement[] = [];
+  if (Array.isArray(record.edits)) {
+    for (const entry of record.edits) {
+      const normalized = normalizeEditReplacement(entry);
+      if (normalized) {
+        replacements.push(normalized);
+      }
+    }
+  }
+  if (typeof record.oldText === "string" && record.oldText.trim().length > 0) {
+    if (typeof record.newText === "string") {
+      replacements.push({
+        oldText: record.oldText,
+        newText: record.newText,
+      });
+    }
+  }
+  if (replacements.length > 0) {
+    record.edits = replacements;
+  }
+}
+
+function hasValidEditReplacements(record: Record<string, unknown>): boolean {
+  const edits = record.edits;
+  return (
+    Array.isArray(edits) &&
+    edits.length > 0 &&
+    edits.every((entry) => normalizeEditReplacement(entry) !== undefined)
+  );
+}
+
 function normalizeClaudeParamAliases(record: Record<string, unknown>) {
   for (const { original, alias } of CLAUDE_PARAM_ALIASES) {
     if (alias in record && !(original in record)) {
@@ -145,19 +238,7 @@ export function normalizeToolParams(params: unknown): Record<string, unknown> | 
   normalizeTextLikeParam(normalized, "content");
   normalizeTextLikeParam(normalized, "oldText");
   normalizeTextLikeParam(normalized, "newText");
-  // Normalize aliases inside edits array entries (pi-coding-agent nested format).
-  if (Array.isArray(normalized.edits)) {
-    normalized.edits = (normalized.edits as unknown[]).map((edit) => {
-      if (!edit || typeof edit !== "object") {
-        return edit;
-      }
-      const entry = { ...(edit as Record<string, unknown>) };
-      normalizeClaudeParamAliases(entry);
-      normalizeTextLikeParam(entry, "oldText");
-      normalizeTextLikeParam(entry, "newText");
-      return entry;
-    });
-  }
+  normalizeEditReplacements(normalized);
   return normalized;
 }
 
@@ -191,35 +272,6 @@ export function patchToolSchemaForClaudeCompatibility(tool: AnyAgentTool): AnyAg
   };
 }
 
-function isParamSatisfiedInEditsArray(
-  record: Record<string, unknown>,
-  keys: readonly string[],
-  allowEmpty: boolean,
-): boolean {
-  if (!Array.isArray(record.edits)) {
-    return false;
-  }
-  return (record.edits as unknown[]).some((edit) => {
-    if (!edit || typeof edit !== "object") {
-      return false;
-    }
-    const entry = edit as Record<string, unknown>;
-    return keys.some((key) => {
-      if (!(key in entry)) {
-        return false;
-      }
-      const value = entry[key];
-      if (typeof value !== "string") {
-        return false;
-      }
-      if (allowEmpty) {
-        return true;
-      }
-      return value.trim().length > 0;
-    });
-  });
-}
-
 export function assertRequiredParams(
   record: Record<string, unknown> | undefined,
   groups: readonly RequiredParamGroup[],
@@ -232,6 +284,7 @@ export function assertRequiredParams(
   const missingLabels: string[] = [];
   for (const group of groups) {
     const satisfied =
+      group.validator?.(record) ??
       group.keys.some((key) => {
         if (!(key in record)) {
           return false;
@@ -244,7 +297,7 @@ export function assertRequiredParams(
           return true;
         }
         return value.trim().length > 0;
-      }) || isParamSatisfiedInEditsArray(record, group.keys, !!group.allowEmpty);
+      });
 
     if (!satisfied) {
       const label = group.label ?? group.keys.join(" or ");
@@ -255,7 +308,8 @@ export function assertRequiredParams(
   if (missingLabels.length > 0) {
     const joined = missingLabels.join(", ");
     const noun = missingLabels.length === 1 ? "parameter" : "parameters";
-    throw parameterValidationError(`Missing required ${noun}: ${joined}`);
+    const receivedHint = formatReceivedParamHint(record, groups);
+    throw parameterValidationError(`Missing required ${noun}: ${joined}${receivedHint}`);
   }
 }
 

@@ -1,69 +1,58 @@
-import { AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
-import OpenAI from "openai";
-import { describe, expect, it } from "vitest";
-import {
-  registerProviderPlugin,
-  requireRegisteredProvider,
-} from "../../test/helpers/plugins/provider-registration.js";
-import plugin from "./index.js";
+import { describe, expect, it, vi } from "vitest";
+import { registerSingleProviderPlugin } from "../../test/helpers/plugins/plugin-registration.js";
+import openrouterPlugin from "./index.js";
 
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY ?? "";
-const LIVE_MODEL_ID =
-  process.env.OPENCLAW_LIVE_OPENROUTER_PLUGIN_MODEL?.trim() || "openai/gpt-5.4-nano";
-const liveEnabled = OPENROUTER_API_KEY.trim().length > 0 && process.env.OPENCLAW_LIVE_TEST === "1";
-const describeLive = liveEnabled ? describe : describe.skip;
+describe("openrouter provider hooks", () => {
+  it("owns native reasoning output mode", async () => {
+    const provider = await registerSingleProviderPlugin(openrouterPlugin);
 
-const registerOpenRouterPlugin = () =>
-  registerProviderPlugin({
-    plugin,
-    id: "openrouter",
-    name: "OpenRouter Provider",
+    expect(
+      provider.resolveReasoningOutputMode?.({
+        provider: "openrouter",
+        modelApi: "openai-completions",
+        modelId: "openai/gpt-5.4",
+      } as never),
+    ).toBe("native");
   });
 
-describe("openrouter plugin", () => {
-  it("registers the expected provider surfaces", () => {
-    const { providers, speechProviders, mediaProviders, imageProviders } =
-      registerOpenRouterPlugin();
+  it("injects provider routing into compat before applying stream wrappers", async () => {
+    const provider = await registerSingleProviderPlugin(openrouterPlugin);
+    let capturedModel: Record<string, unknown> | undefined;
+    const baseStreamFn = vi.fn((model) => {
+      capturedModel = model as Record<string, unknown>;
+      return { async *[Symbol.asyncIterator]() {} } as never;
+    });
 
-    expect(providers).toHaveLength(1);
-    expect(providers.map((provider) => provider.id)).toEqual(["openrouter"]);
-    expect(speechProviders).toHaveLength(0);
-    expect(mediaProviders.map((provider) => provider.id)).toEqual(["openrouter"]);
-    expect(imageProviders).toHaveLength(0);
+    const wrapped = provider.wrapStreamFn?.({
+      provider: "openrouter",
+      modelId: "openai/gpt-5.4",
+      extraParams: {
+        provider: {
+          order: ["moonshot"],
+        },
+      },
+      streamFn: baseStreamFn,
+      thinkingLevel: "high",
+    } as never);
+
+    wrapped?.(
+      {
+        provider: "openrouter",
+        api: "openai-completions",
+        id: "openai/gpt-5.4",
+        compat: {},
+      } as never,
+      { messages: [] } as never,
+      {},
+    );
+
+    expect(baseStreamFn).toHaveBeenCalledOnce();
+    expect(capturedModel).toMatchObject({
+      compat: {
+        openRouterRouting: {
+          order: ["moonshot"],
+        },
+      },
+    });
   });
-});
-
-describeLive("openrouter plugin live", () => {
-  it("registers an OpenRouter provider that can complete a live request", async () => {
-    const { providers } = registerOpenRouterPlugin();
-    const provider = requireRegisteredProvider(providers, "openrouter");
-
-    const resolved = provider.resolveDynamicModel?.({
-      provider: "openrouter",
-      modelId: LIVE_MODEL_ID,
-      modelRegistry: new ModelRegistry(AuthStorage.inMemory()),
-    });
-    if (!resolved) {
-      throw new Error(`openrouter provider did not resolve ${LIVE_MODEL_ID}`);
-    }
-
-    expect(resolved).toMatchObject({
-      provider: "openrouter",
-      id: LIVE_MODEL_ID,
-      api: "openai-completions",
-      baseUrl: "https://openrouter.ai/api/v1",
-    });
-
-    const client = new OpenAI({
-      apiKey: OPENROUTER_API_KEY,
-      baseURL: resolved.baseUrl,
-    });
-    const response = await client.chat.completions.create({
-      model: resolved.id,
-      messages: [{ role: "user", content: "Reply with exactly OK." }],
-      max_tokens: 16,
-    });
-
-    expect(response.choices[0]?.message?.content?.trim()).toMatch(/^OK[.!]?$/);
-  }, 30_000);
 });
