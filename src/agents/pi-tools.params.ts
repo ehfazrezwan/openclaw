@@ -4,7 +4,7 @@ export type RequiredParamGroup = {
   keys: readonly string[];
   allowEmpty?: boolean;
   label?: string;
-  validator?: (record: Record<string, unknown>) => boolean;
+  validator?: (record: Record<string, unknown>) => boolean | undefined;
 };
 
 const RETRY_GUIDANCE_SUFFIX = " Supply correct parameters before retrying.";
@@ -183,13 +183,12 @@ function normalizeEditReplacements(record: Record<string, unknown>) {
   }
 }
 
-function hasValidEditReplacements(record: Record<string, unknown>): boolean {
+function hasValidEditReplacements(record: Record<string, unknown>): boolean | undefined {
   const edits = record.edits;
-  return (
-    Array.isArray(edits) &&
-    edits.length > 0 &&
-    edits.every((entry) => normalizeEditReplacement(entry) !== undefined)
-  );
+  if (!Array.isArray(edits) || edits.length === 0) {
+    return undefined;
+  }
+  return edits.every((entry) => normalizeEditReplacement(entry) !== undefined);
 }
 
 function normalizeClaudeParamAliases(record: Record<string, unknown>) {
